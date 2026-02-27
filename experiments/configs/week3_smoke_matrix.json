@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "name": "week3_smoke_matrix",
+    "nproc_per_node": 2,
+    "steps": 10,
+    "seq_len": 128,
+    "batch_size": 4,
+    "grad_accum_steps": 1,
+    "collective_impl": "ring",
+    "data_mode": "synthetic",
+    "dtype": "float32",
+    "bandwidth_mode": "simulated",
+    "sim_latency_ms": 0.0,
+    "max_grad_norm": 0.0
+  },
+  "matrix": {
+    "stages": [0, 1, 2, 3],
+    "model_sizes": ["tiny"],
+    "bandwidth_gbps": [0.0, 5.0, 10.0, 25.0]
+  }
+}

@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 
 from model.config import ModelConfig
 from model.llama import LlamaForCausalLM
-from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer
+from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
 
 pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
@@ -76,6 +76,8 @@ def _run_stage_worker(rank: int, world_size: int, port: int, stage: int, max_gra
             engine = ZeROStage1Optimizer(model=model_zero, lr=lr, betas=betas, eps=eps, weight_decay=wd)
         elif stage == 2:
             engine = ZeROStage2Optimizer(model=model_zero, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        elif stage == 3:
+            engine = ZeROStage3Optimizer(model=model_zero, lr=lr, betas=betas, eps=eps, weight_decay=wd)
         else:
             raise ValueError(f"unknown stage: {stage}")
 
@@ -97,6 +99,7 @@ def _run_stage_worker(rank: int, world_size: int, port: int, stage: int, max_gra
 
             # ZeRO stage step using local micro-batch.
             engine.zero_grad()
+            engine.prepare_forward()
             loss_zero = model_zero(input_ids=local_ids, labels=local_ids).loss
             assert loss_zero is not None
             engine.backward(loss_zero)
@@ -111,6 +114,7 @@ def _run_stage_worker(rank: int, world_size: int, port: int, stage: int, max_gra
                 torch.nn.utils.clip_grad_norm_(model_ref.parameters(), max_norm=max_grad_norm)
             opt_ref.step()
 
+            engine.prepare_forward()
             _assert_models_close(model_zero, model_ref, msg=f"stage={stage} step={step} rank={rank}")
 
     finally:
@@ -123,11 +127,12 @@ def _spawn_stage(stage: int, world_size: int, max_grad_norm: float = 0.0) -> Non
     mp.spawn(_run_stage_worker, args=(world_size, port, stage, max_grad_norm), nprocs=world_size, join=True)
 
 
-@pytest.mark.parametrize("stage", [0, 1, 2])
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("world_size", [2, 3])
 def test_stages_match_reference_global_batch(stage: int, world_size: int) -> None:
     _spawn_stage(stage=stage, world_size=world_size)
 
 
-def test_stage2_with_grad_clipping_matches_reference_world3() -> None:
-    _spawn_stage(stage=2, world_size=3, max_grad_norm=0.5)
+@pytest.mark.parametrize("stage", [2, 3])
+def test_stage_sharded_with_grad_clipping_matches_reference_world3(stage: int) -> None:
+    _spawn_stage(stage=stage, world_size=3, max_grad_norm=0.5)

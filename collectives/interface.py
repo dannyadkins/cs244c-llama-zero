@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -60,6 +62,10 @@ class TorchCollectives(CollectiveOps):
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
         out = tensor.clone()
         dist.all_reduce(out)
+        _maybe_simulate_collective_delay(
+            num_bytes=out.numel() * out.element_size(),
+            world_size=dist.get_world_size(),
+        )
         if average:
             out /= dist.get_world_size()
         return out
@@ -80,6 +86,10 @@ class TorchCollectives(CollectiveOps):
 
             try:
                 dist.reduce_scatter(out, inputs)
+                _maybe_simulate_collective_delay(
+                    num_bytes=out.numel() * out.element_size(),
+                    world_size=world_size,
+                )
                 return out
             except RuntimeError as exc:
                 # CPU/Gloo does not support reduce_scatter in many environments.
@@ -90,6 +100,10 @@ class TorchCollectives(CollectiveOps):
         # then return this rank's ceil-sized shard.
         reduced = flat.clone()
         dist.all_reduce(reduced)
+        _maybe_simulate_collective_delay(
+            num_bytes=reduced.numel() * reduced.element_size(),
+            world_size=world_size,
+        )
 
         chunk = (flat.numel() + world_size - 1) // world_size
         start = rank * chunk
@@ -117,9 +131,32 @@ class TorchCollectives(CollectiveOps):
 
         gathered = [torch.empty_like(padded) for _ in range(world_size)]
         dist.all_gather(gathered, padded)
+        _maybe_simulate_collective_delay(
+            num_bytes=padded.numel() * padded.element_size(),
+            world_size=world_size,
+        )
 
         if len(set(sizes)) == 1:
             return torch.cat(gathered, dim=0)
 
         trimmed = [gathered[i][: sizes[i]] for i in range(world_size)]
         return torch.cat(trimmed, dim=0)
+
+
+def _maybe_simulate_collective_delay(num_bytes: int, world_size: int) -> None:
+    bw_env = os.environ.get("ZERO_SIM_BW_GBPS", "").strip()
+    lat_env = os.environ.get("ZERO_SIM_LATENCY_MS", "").strip()
+    if not bw_env and not lat_env:
+        return
+
+    bandwidth_gbps = float(bw_env) if bw_env else 0.0
+    latency_ms = float(lat_env) if lat_env else 0.0
+
+    delay_s = 0.0
+    if bandwidth_gbps > 0:
+        delay_s += ((world_size - 1) * num_bytes) / (bandwidth_gbps * 1e9)
+    if latency_ms > 0:
+        delay_s += latency_ms / 1000.0
+
+    if delay_s > 0:
+        time.sleep(delay_s)

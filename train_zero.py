@@ -16,13 +16,13 @@ from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
 from model import LlamaForCausalLM, build_config, estimate_num_parameters, human_readable_count
 from profiler import MemoryTracker, TimerRegistry
 from train import batch_from_chunk, make_data_loader, set_seed
-from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer
+from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Week 2: ZeRO stages 0-2 training")
+    parser = argparse.ArgumentParser(description="Weeks 2-3: ZeRO stages 0-3 training")
 
-    parser.add_argument("--zero-stage", type=int, default=0, choices=[0, 1, 2])
+    parser.add_argument("--zero-stage", type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument("--collective-impl", type=str, default="ring", choices=["ring", "torch"])
 
     parser.add_argument("--model-size", type=str, default="tiny", choices=["tiny", "small", "medium"])
@@ -119,6 +119,8 @@ def build_engine(args: argparse.Namespace, model: LlamaForCausalLM, collectives)
         return ZeROStage1Optimizer(**kwargs)
     if args.zero_stage == 2:
         return ZeROStage2Optimizer(**kwargs)
+    if args.zero_stage == 3:
+        return ZeROStage3Optimizer(**kwargs)
     raise ValueError(f"Unsupported stage: {args.zero_stage}")
 
 
@@ -219,6 +221,11 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         engine.zero_grad()
+        prepare_comm_ms = 0.0
+        if hasattr(engine, "prepare_forward"):
+            prepare_stats = engine.prepare_forward()
+            if isinstance(prepare_stats, dict):
+                prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
         fwd_bwd_timer = timers.timer("forward_backward")
         fwd_bwd_timer.start()
 
@@ -251,6 +258,7 @@ def train(args: argparse.Namespace) -> None:
         step_stats = engine.step_with_stats(max_grad_norm=args.max_grad_norm)
         _ = step_timer.stop()
         grad_norm_value = float(step_stats["grad_norm"])
+        comm_ms = float(step_stats["comm_ms"]) + prepare_comm_ms
 
         local_step_loss = float(sum(micro_losses) / len(micro_losses))
         step_loss = global_mean_scalar(local_step_loss, device=device, world_size=world_size)
@@ -268,7 +276,7 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"[step {step:05d}] loss={step_loss:.4f} avg100={avg_loss:.4f} "
                 f"tokens/s={tokens_per_second:,.0f} grad_norm={grad_norm_value:.3f} "
-                f"fb_ms={fwd_bwd_ms:.2f} comm_ms={step_stats['comm_ms']:.2f} opt_ms={step_stats['optim_ms']:.2f}"
+                f"fb_ms={fwd_bwd_ms:.2f} comm_ms={comm_ms:.2f} opt_ms={step_stats['optim_ms']:.2f}"
             )
 
         if rank_profile_enabled:
@@ -279,7 +287,7 @@ def train(args: argparse.Namespace) -> None:
                     "tokens_per_second": tokens_per_second,
                     "grad_norm": grad_norm_value,
                     "forward_backward_ms": fwd_bwd_ms,
-                    "communication_ms": float(step_stats["comm_ms"]),
+                    "communication_ms": comm_ms,
                     "optimizer_ms": float(step_stats["optim_ms"]),
                     "iteration_ms": iter_ms,
                 }

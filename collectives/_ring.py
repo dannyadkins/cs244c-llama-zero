@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import time
 from typing import List, Sequence, Tuple
 
 import torch
@@ -49,6 +51,26 @@ def _exchange_with_send_recv(
     send_req = dist.isend(send_buf, dst=send_rank, tag=tag)
     send_req.wait()
     recv_req.wait()
+    _maybe_simulate_link_delay(send_buf.numel() * send_buf.element_size())
+
+
+def _maybe_simulate_link_delay(num_bytes: int) -> None:
+    bw_env = os.environ.get("ZERO_SIM_BW_GBPS", "").strip()
+    lat_env = os.environ.get("ZERO_SIM_LATENCY_MS", "").strip()
+    if not bw_env and not lat_env:
+        return
+
+    bandwidth_gbps = float(bw_env) if bw_env else 0.0
+    latency_ms = float(lat_env) if lat_env else 0.0
+
+    delay_s = 0.0
+    if bandwidth_gbps > 0:
+        delay_s += num_bytes / (bandwidth_gbps * 1e9)
+    if latency_ms > 0:
+        delay_s += latency_ms / 1000.0
+
+    if delay_s > 0:
+        time.sleep(delay_s)
 
 
 def _ring_reduce_scatter_inplace(
