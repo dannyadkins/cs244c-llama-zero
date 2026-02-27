@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 checkpoints/
+experiments/results/*.json
 
 # local envs
 .venv/

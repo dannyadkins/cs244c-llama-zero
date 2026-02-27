@@ -1,38 +1,71 @@
-# ZeRO From Scratch (Week 1 - Person A)
+# ZeRO From Scratch (Week 1 Complete)
 
-This repository contains a clean Week 1 baseline for the ZeRO project:
+This repo now includes both Week 1 tracks:
 
-- LLaMA-style model in PyTorch (`RMSNorm`, `RoPE`, `GQA`, `SwiGLU`)
-- Size configs for `tiny` (~46M), `small` (~318M), `medium` (~1.34B)
-- Single-device training loop with AdamW
-- FineWeb-Edu streaming pipeline
-- Correctness-oriented tests
+- **Person A**: LLaMA-style model + single-device training + FineWeb-Edu pipeline
+- **Person B**: send/recv collectives + distributed correctness tests + profiling + launch/throttle infra
 
-## Project Layout
+## Week 1 Deliverables
 
-- `model/config.py`: model configs + parameter estimation
-- `model/llama.py`: full model implementation
-- `data/fineweb.py`: tokenizer + streaming/packing datasets
-- `train.py`: training entrypoint (single GPU baseline)
-- `tests/`: unit/invariant/optimization tests
+### Person A (training correctness baseline)
 
-## Quick Start
+- LLaMA-style architecture (`RMSNorm`, `RoPE`, `GQA`, `SwiGLU`)
+- Config presets for `tiny`, `small`, `medium`
+- Single-device training entrypoint (`train.py`)
+- FineWeb-Edu streaming and deterministic synthetic fallback
+- Unit tests proving shape correctness, causality, gradient flow, and learning signal
 
-Install dependencies:
+### Person B (collectives + instrumentation)
+
+- Ring collectives from `torch.distributed.send/recv`:
+  - `allreduce`
+  - `reduce_scatter`
+  - `allgather`
+- Distributed tests vs built-in torch collectives (`gloo`, multi-process)
+- Profiling utilities:
+  - CUDA-event timer with CPU fallback
+  - memory snapshot/tracker
+  - overlap efficiency utility
+- Infra scripts for setup, `torchrun` launch, and Linux `tc` throttling
+
+## Repository Layout
+
+- `model/`
+  - `config.py`
+  - `llama.py`
+- `data/`
+  - `fineweb.py`
+- `collectives/`
+  - `_ring.py`
+  - `ring_allreduce.py`
+  - `ring_reduce_scatter.py`
+  - `ring_allgather.py`
+  - `interface.py`
+  - `tests/test_collectives_distributed.py`
+- `profiler/`
+  - `timer.py`
+  - `memory.py`
+  - `overlap.py`
+- `scripts/`
+  - `distributed_sanity.py`
+  - `benchmark_collectives.py`
+- `infra/`
+  - `setup.sh`
+  - `launch.sh`
+  - `throttle.sh`
+- `tests/`
+  - model/data/training/profiler unit tests
+
+## Setup
 
 ```bash
-pip install -r requirements.txt
+cd /Users/danieladkins/cs244c-llama-zero
+./infra/setup.sh
 ```
 
-Run tests:
+## Person A: Single-Device Training
 
-```bash
-pytest -q
-```
-
-## Train (Synthetic sanity run)
-
-This is fully offline and should show loss decreasing quickly:
+### Offline sanity run (synthetic data)
 
 ```bash
 python train.py \
@@ -45,7 +78,7 @@ python train.py \
   --log-interval 10
 ```
 
-## Train (FineWeb-Edu + LLaMA tokenizer)
+### FineWeb-Edu streaming run
 
 ```bash
 python train.py \
@@ -62,20 +95,68 @@ python train.py \
 
 Notes:
 
-- `meta-llama/Llama-3.1-8B` may require a HuggingFace token with accepted license terms.
-- If external dataset/tokenizer access fails, use `--allow-synthetic-fallback`.
+- `meta-llama/Llama-3.1-8B` is gated on HuggingFace. If unavailable, use:
+  - `--allow-synthetic-fallback`
+  - or `--tokenizer-name gpt2`
 
-## Correctness Checks Implemented
+## Person B: Distributed Collectives + Profiling
 
-- Shape and backward-pass checks
-- Causal masking invariant (future tokens do not affect past logits)
-- Rotary embedding norm preservation
-- Deterministic overfit test proving optimizer + gradient flow works
-- Config/parameter-count sanity checks for tiny/small/medium scale ordering
+### Run all tests
 
-## Week 1 Deliverable Mapping
+```bash
+pytest -q
+```
 
-- Model and training loop: complete (`model/`, `train.py`)
-- Data loading from FineWeb-Edu streaming: complete (`data/fineweb.py`)
-- Single-GPU correctness baseline: complete (tests + synthetic train command)
-- Ready extension points for Week 2 ZeRO wrappers: model forward API and data pipeline are stable and modular
+### Run distributed collective correctness tests only
+
+```bash
+pytest -q collectives/tests/test_collectives_distributed.py
+```
+
+### Torchrun sanity check
+
+```bash
+./infra/launch.sh --nproc-per-node 2 --script scripts/distributed_sanity.py
+```
+
+### Benchmark ring vs torch collectives (JSON output)
+
+```bash
+torchrun --standalone --nproc_per_node=2 scripts/benchmark_collectives.py \
+  --ops allreduce reduce_scatter allgather \
+  --sizes 4096 65536 1048576 \
+  --impl both \
+  --iters 20 \
+  --warmup 5 \
+  --output-json experiments/results/week1_collectives.json
+```
+
+## Bandwidth Throttling (Linux)
+
+```bash
+# Apply egress cap
+./infra/throttle.sh apply eth0 10gbit 1mb 10ms
+
+# Inspect qdisc
+./infra/throttle.sh status eth0
+
+# Remove throttle
+./infra/throttle.sh delete eth0
+```
+
+Validate with `iperf3` before and after throttling to confirm the cap is effective.
+
+## Week 2 Integration Contract
+
+Person A should treat communication as a black-box interface:
+
+- `CollectiveOps.allreduce(tensor)`
+- `CollectiveOps.reduce_scatter(tensor)`
+- `CollectiveOps.allgather(local_shard)`
+
+Use:
+
+- `SendRecvCollectives` for custom implementation
+- `TorchCollectives` as reference baseline
+
+This keeps ZeRO stage wrappers decoupled from transport internals.
