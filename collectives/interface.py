@@ -23,6 +23,23 @@ class CollectiveOps:
 
 
 @dataclass
+class LocalCollectives(CollectiveOps):
+    """Single-process fallback used when distributed is not initialized."""
+
+    def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        out = tensor.clone()
+        if average:
+            out /= 1.0
+        return out
+
+    def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.contiguous().view(-1).clone()
+
+    def allgather(self, local_shard: torch.Tensor) -> torch.Tensor:
+        return local_shard.contiguous().view(-1).clone()
+
+
+@dataclass
 class SendRecvCollectives(CollectiveOps):
     """Custom collectives implemented from send/recv primitives."""
 
@@ -76,6 +93,7 @@ class TorchCollectives(CollectiveOps):
 
     def allgather(self, local_shard: torch.Tensor) -> torch.Tensor:
         local_flat = local_shard.contiguous().view(-1)
-        gathered = [torch.empty_like(local_flat) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, local_flat)
-        return torch.cat(gathered, dim=0)
+
+        objects = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(objects, local_flat)
+        return torch.cat([x.view(-1) for x in objects], dim=0)

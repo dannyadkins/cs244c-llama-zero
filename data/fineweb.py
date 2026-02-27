@@ -120,3 +120,20 @@ class SyntheticPatternDataset(IterableDataset):
             cursor = (cursor + length) % self.vocab_size
             produced += 1
             yield chunk
+
+
+class RankShardIterableDataset(IterableDataset):
+    """Strides an iterable dataset so each rank sees a disjoint shard."""
+
+    def __init__(self, dataset: IterableDataset, rank: int, world_size: int) -> None:
+        super().__init__()
+        if rank < 0 or world_size <= 0 or rank >= world_size:
+            raise ValueError(f"invalid rank/world_size: rank={rank}, world_size={world_size}")
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        for idx, sample in enumerate(self.dataset):
+            if idx % self.world_size == self.rank:
+                yield sample

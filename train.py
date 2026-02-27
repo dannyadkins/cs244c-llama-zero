@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from data import (
     PackedFineWebDataset,
+    RankShardIterableDataset,
     SyntheticPatternDataset,
     load_fineweb_stream,
     load_llama_tokenizer,
@@ -83,6 +84,8 @@ def choose_device(device_arg: str) -> torch.device:
 def make_data_loader(
     args: argparse.Namespace,
     vocab_size_for_model: int,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, int, Dict[str, str]]:
     metadata: Dict[str, str] = {}
 
@@ -108,6 +111,10 @@ def make_data_loader(
         dataset = SyntheticPatternDataset(seq_len=args.seq_len, vocab_size=vocab_size)
         metadata["tokenizer"] = "synthetic"
         metadata["dataset"] = "synthetic_pattern"
+
+    if world_size > 1:
+        dataset = RankShardIterableDataset(dataset=dataset, rank=rank, world_size=world_size)
+        metadata["data_sharding"] = f"rank_stride:{rank}/{world_size}"
 
     loader = DataLoader(
         dataset,
