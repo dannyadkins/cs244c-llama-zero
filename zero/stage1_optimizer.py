@@ -49,6 +49,9 @@ class ZeROStage1Optimizer:
     def backward(self, loss: torch.Tensor) -> None:
         loss.backward()
 
+    def prepare_forward(self) -> Dict[str, float]:
+        return {"prepare_comm_ms": 0.0}
+
     def zero_grad(self) -> None:
         for p in self.meta.params:
             p.grad = None

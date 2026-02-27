@@ -1,10 +1,6 @@
-# ZeRO From Scratch (Weeks 1-2)
+# ZeRO From Scratch (Weeks 1-3)
 
-This repository now includes:
-
-- Week 1 Person A baseline (model, data, single-device training correctness)
-- Week 1 Person B foundation (custom collectives, profiling, infra)
-- Week 2 ZeRO stages 0-2 implementation and distributed training entrypoint
+This repository now contains the Week 1 foundation, Week 2 ZeRO stages 0-2 integration, and Week 3 Stage 3 + experiment harness/analysis tooling.
 
 ## Implemented Scope
 
@@ -14,22 +10,31 @@ This repository now includes:
 - `tiny`, `small`, `medium` model configs
 - Single-device training script: `train.py`
 - FineWeb-Edu streaming pipeline + synthetic fallback
-- Correctness tests for model/data/training
+- Baseline correctness tests for model/data/training
 
 ### Week 1 Person B
 
-- Ring collectives from point-to-point primitives
-- Distributed correctness tests vs torch reference behavior
-- Profiling utilities: timer, memory tracker, overlap metric
-- Infra scripts for setup, launch, and Linux `tc` throttling
+- Ring collectives from point-to-point `send/recv`
+- Distributed correctness tests vs torch collective behavior
+- Profiling utilities: timers, memory snapshots, overlap metrics
+- Infra scripts for setup, launch, and `tc` throttling
 
 ### Week 2 (ZeRO 0-2)
 
-- `zero/stage0_ddp.py`: allreduce gradients + replicated optimizer
-- `zero/stage1_optimizer.py`: partition optimizer states + allreduce gradients + allgather params
-- `zero/stage2_optimizer.py`: partition optimizer states + reduce-scatter gradients + allgather params
-- `train_zero.py`: distributed training for ZeRO stages 0/1/2
-- Distributed tests validating stage updates against full global-batch AdamW reference
+- `zero/stage0_ddp.py`: replicated model + gradient allreduce + local AdamW
+- `zero/stage1_optimizer.py`: sharded optimizer state + gradient allreduce + param allgather
+- `zero/stage2_optimizer.py`: sharded optimizer state + gradient reduce-scatter + param allgather
+- `train_zero.py`: distributed training entrypoint with profiling output
+
+### Week 3 (ZeRO 3 + Harness)
+
+- `zero/stage3_optimizer.py`: correctness-first Stage 3 communication pattern
+- `train_zero.py --zero-stage 3` integration
+- `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
+- Simulated bandwidth mode via env-driven collective delay (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
+- Optional `tc` throttling mode integration in harness
+- Per-case theoretical state-memory breakdown (params/grads/optimizer by stage)
+- `analysis/visualize.py`: plots for throughput/communication vs bandwidth and loss curves
 
 ## Repository Layout
 
@@ -40,10 +45,10 @@ This repository now includes:
 - `profiler/`: timing/memory/overlap instrumentation
 - `infra/`: setup/launch/throttle scripts
 - `scripts/`: distributed sanity + collective benchmarking
-- `tests/`: unit tests for model/data/training/profiler
-- `experiments/`: configs/results scaffolding
-- `analysis/`: figure scaffolding
-- `report/`: writeup scaffolding
+- `experiments/`: harness + configs + result artifacts
+- `analysis/`: figure generation tools
+- `report/`: writeup scaffold
+- `tests/`: unit/integration tests
 
 ## Setup
 
@@ -52,25 +57,23 @@ cd /Users/danieladkins/cs244c-llama-zero
 ./infra/setup.sh
 ```
 
-## Run Tests
+## Test Everything
 
 ```bash
 pytest -q
 ```
 
-Key distributed tests:
+Distributed-focused tests:
 
 ```bash
 pytest -q collectives/tests/test_collectives_distributed.py
 pytest -q zero/tests/test_zero_stages.py
 ```
 
-## Week 1 Baseline Training
-
-Synthetic sanity:
+## Baseline Training (Single GPU / CPU)
 
 ```bash
-python train.py \
+python3 train.py \
   --data-mode synthetic \
   --model-size tiny \
   --seq-len 128 \
@@ -79,124 +82,84 @@ python train.py \
   --max-steps 100
 ```
 
-FineWeb-Edu streaming:
-
-```bash
-python train.py \
-  --data-mode fineweb \
-  --tokenizer-name meta-llama/Llama-3.1-8B \
-  --fineweb-subset sample-10BT \
-  --model-size tiny \
-  --seq-len 512 \
-  --batch-size 2 \
-  --grad-accum-steps 8 \
-  --max-steps 500
-```
-
-If tokenizer access is gated, use `--allow-synthetic-fallback` or `--tokenizer-name gpt2`.
-
-## Week 2 ZeRO Training
-
-Run stage 0/1/2 with 2 processes on one node:
+## ZeRO Training (Stages 0-3)
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train_zero.py \
-  --zero-stage 0 \
+  --zero-stage 3 \
   --collective-impl ring \
   --data-mode synthetic \
   --model-size tiny \
   --seq-len 128 \
   --batch-size 4 \
-  --max-steps 50
-```
-
-```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
-  --zero-stage 1 \
-  --collective-impl ring \
-  --data-mode synthetic \
-  --model-size tiny \
-  --seq-len 128 \
-  --batch-size 4 \
-  --max-steps 50
-```
-
-```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
-  --zero-stage 2 \
-  --collective-impl ring \
-  --data-mode synthetic \
-  --model-size tiny \
-  --seq-len 128 \
-  --batch-size 4 \
-  --max-steps 50
-```
-
-Notes:
-
-- `--collective-impl torch` now supports uneven parameter counts for stage 2 via a robust fallback path.
-- Gradient clipping in Week 2 is applied on synchronized gradients inside each ZeRO stage engine (`--max-grad-norm`).
-
-## Distributed Sanity and Benchmarking
-
-Sanity check:
-
-```bash
-./infra/launch.sh --nproc-per-node 2 --script scripts/distributed_sanity.py
-```
-
-Collective benchmark to JSON:
-
-```bash
-torchrun --standalone --nproc_per_node=2 scripts/benchmark_collectives.py \
-  --ops allreduce reduce_scatter allgather \
-  --sizes 4096 65536 1048576 \
-  --impl both \
-  --iters 20 \
-  --warmup 5 \
-  --output-json experiments/results/week1_collectives.json
-```
-
-## Week 2 Harness and Plotting
-
-Run a staged ZeRO sweep and save logs + summary JSON:
-
-```bash
-python experiments/harness.py \
-  --name week2_baseline \
-  --stages 0 1 2 \
-  --nproc-per-node 2 \
-  --steps 50 \
-  --model-size tiny \
-  --seq-len 128 \
-  --batch-size 4
-```
-
-Plot loss curves from the run:
-
-```bash
-python analysis/visualize.py \
-  --run-dir experiments/results/week2_baseline \
-  --output analysis/figures/week2_loss_curves.png
-```
-
-Optional per-step profiling to JSON:
-
-```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
-  --zero-stage 1 \
-  --collective-impl ring \
-  --data-mode synthetic \
-  --model-size tiny \
-  --seq-len 128 \
-  --batch-size 4 \
-  --max-steps 20 \
-  --profile-json experiments/results/week2_stage1_profile.json \
-  --profile-memory-interval 5 \
+  --max-steps 50 \
+  --profile-json experiments/results/stage3_profile.json \
   --profile-rank0-only
 ```
 
-## Bandwidth Throttling (Linux)
+## Week 3 Harness
+
+Run a config-driven matrix:
+
+```bash
+python3 experiments/harness.py --config experiments/configs/week3_smoke_matrix.json
+```
+
+Run a custom sweep directly from CLI:
+
+```bash
+python3 experiments/harness.py \
+  --name week3_medium_bandwidth \
+  --stages 0 1 2 3 \
+  --model-sizes medium \
+  --bandwidth-gbps 0 1 2.5 5 10 25 50 \
+  --bandwidth-mode simulated \
+  --nproc-per-node 2 \
+  --steps 100
+```
+
+Optional real throttling mode (Linux root/sudo required):
+
+```bash
+python3 experiments/harness.py \
+  --name week3_tc_trial \
+  --stages 2 3 \
+  --model-sizes tiny \
+  --bandwidth-gbps 5 10 \
+  --bandwidth-mode tc \
+  --tc-interface eth0
+```
+
+## Visualization
+
+Throughput vs bandwidth:
+
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/week3_medium_bandwidth \
+  --plot throughput \
+  --output analysis/figures/week3_throughput_vs_bandwidth.png
+```
+
+Communication vs bandwidth:
+
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/week3_medium_bandwidth \
+  --plot comm \
+  --output analysis/figures/week3_comm_vs_bandwidth.png
+```
+
+Loss curves:
+
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/week3_medium_bandwidth \
+  --plot loss \
+  --output analysis/figures/week3_loss_curves.png
+```
+
+## Bandwidth Control (`tc`)
 
 ```bash
 ./infra/throttle.sh apply eth0 10gbit 1mb 10ms
@@ -204,11 +167,11 @@ torchrun --standalone --nproc_per_node=2 train_zero.py \
 ./infra/throttle.sh delete eth0
 ```
 
-Validate with `iperf3` before and after throttling.
+Validate applied throttling with `iperf3` before collecting data.
 
-## Week 2 Interface Contract
+## Communication Interface Contract
 
-ZeRO wrappers use communication as a black-box API:
+ZeRO wrappers treat communication as a black box:
 
 - `allreduce(tensor, average=True)`
 - `reduce_scatter(tensor)`
@@ -217,5 +180,5 @@ ZeRO wrappers use communication as a black-box API:
 Implementations:
 
 - `SendRecvCollectives`: custom ring transport
-- `TorchCollectives`: built-in torch baseline
+- `TorchCollectives`: torch distributed baseline
 - `LocalCollectives`: single-process fallback
