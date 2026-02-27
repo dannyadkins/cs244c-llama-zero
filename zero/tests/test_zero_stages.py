@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import socket
-from typing import Callable, Type
 
 import pytest
 import torch
@@ -47,7 +46,7 @@ def _assert_models_close(model_a: LlamaForCausalLM, model_b: LlamaForCausalLM, m
         torch.testing.assert_close(p_a, p_b, atol=2e-5, rtol=2e-5, msg=f"{msg} :: {name_a}")
 
 
-def _run_stage_worker(rank: int, world_size: int, port: int, stage: int) -> None:
+def _run_stage_worker(rank: int, world_size: int, port: int, stage: int, max_grad_norm: float) -> None:
     dist.init_process_group(
         backend="gloo",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -101,13 +100,15 @@ def _run_stage_worker(rank: int, world_size: int, port: int, stage: int) -> None
             loss_zero = model_zero(input_ids=local_ids, labels=local_ids).loss
             assert loss_zero is not None
             engine.backward(loss_zero)
-            engine.step()
+            engine.step(max_grad_norm=max_grad_norm)
 
             # Reference step using the full effective global batch.
             opt_ref.zero_grad(set_to_none=True)
             loss_ref = model_ref(input_ids=global_ids, labels=global_ids).loss
             assert loss_ref is not None
             loss_ref.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model_ref.parameters(), max_norm=max_grad_norm)
             opt_ref.step()
 
             _assert_models_close(model_zero, model_ref, msg=f"stage={stage} step={step} rank={rank}")
@@ -117,18 +118,16 @@ def _run_stage_worker(rank: int, world_size: int, port: int, stage: int) -> None
         dist.destroy_process_group()
 
 
-def _spawn_stage(stage: int, world_size: int = 2) -> None:
+def _spawn_stage(stage: int, world_size: int, max_grad_norm: float = 0.0) -> None:
     port = _find_free_port()
-    mp.spawn(_run_stage_worker, args=(world_size, port, stage), nprocs=world_size, join=True)
+    mp.spawn(_run_stage_worker, args=(world_size, port, stage, max_grad_norm), nprocs=world_size, join=True)
 
 
-def test_stage0_matches_reference_global_batch() -> None:
-    _spawn_stage(stage=0)
+@pytest.mark.parametrize("stage", [0, 1, 2])
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_stages_match_reference_global_batch(stage: int, world_size: int) -> None:
+    _spawn_stage(stage=stage, world_size=world_size)
 
 
-def test_stage1_matches_reference_global_batch() -> None:
-    _spawn_stage(stage=1)
-
-
-def test_stage2_matches_reference_global_batch() -> None:
-    _spawn_stage(stage=2)
+def test_stage2_with_grad_clipping_matches_reference_world3() -> None:
+    _spawn_stage(stage=2, world_size=3, max_grad_norm=0.5)

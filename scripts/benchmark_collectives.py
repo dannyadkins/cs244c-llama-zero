@@ -121,21 +121,12 @@ def run_op(
     # Correctness spot-check against torch collectives when benchmarking ring.
     if impl_name == "ring":
         ref_impl = TorchCollectives()
-        if op == "reduce_scatter" and numel % world_size != 0:
-            # Reference fallback for uneven sizes.
-            reduced = x.clone()
-            dist.all_reduce(reduced)
-            chunk = (numel + world_size - 1) // world_size
-            start = dist.get_rank() * chunk
-            end = min(start + chunk, numel)
-            ref = reduced[start:end].contiguous()
+        if op == "allreduce":
+            ref = ref_impl.allreduce(x)
+        elif op == "reduce_scatter":
+            ref = ref_impl.reduce_scatter(x)
         else:
-            if op == "allreduce":
-                ref = ref_impl.allreduce(x)
-            elif op == "reduce_scatter":
-                ref = ref_impl.reduce_scatter(x)
-            else:
-                ref = ref_impl.allgather(x)
+            ref = ref_impl.allgather(x)
 
         got = call_once()
         torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
@@ -194,9 +185,6 @@ def main() -> None:
     for op in args.ops:
         for numel in args.sizes:
             for impl_name in impls:
-                # Built-in reduce_scatter requires equal chunks.
-                if impl_name == "torch" and op == "reduce_scatter" and numel % world_size != 0:
-                    continue
                 result = run_op(
                     op=op,
                     impl_name=impl_name,

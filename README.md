@@ -132,6 +132,11 @@ torchrun --standalone --nproc_per_node=2 train_zero.py \
   --max-steps 50
 ```
 
+Notes:
+
+- `--collective-impl torch` now supports uneven parameter counts for stage 2 via a robust fallback path.
+- Gradient clipping in Week 2 is applied on synchronized gradients inside each ZeRO stage engine (`--max-grad-norm`).
+
 ## Distributed Sanity and Benchmarking
 
 Sanity check:
@@ -173,6 +178,22 @@ Plot loss curves from the run:
 python analysis/visualize.py \
   --run-dir experiments/results/week2_baseline \
   --output analysis/figures/week2_loss_curves.png
+```
+
+Optional per-step profiling to JSON:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_zero.py \
+  --zero-stage 1 \
+  --collective-impl ring \
+  --data-mode synthetic \
+  --model-size tiny \
+  --seq-len 128 \
+  --batch-size 4 \
+  --max-steps 20 \
+  --profile-json experiments/results/week2_stage1_profile.json \
+  --profile-memory-interval 5 \
+  --profile-rank0-only
 ```
 
 ## Bandwidth Throttling (Linux)

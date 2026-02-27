@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
+from pathlib import Path
 from typing import Dict, Iterator, Tuple
 
 import torch
@@ -13,6 +14,7 @@ import torch.distributed as dist
 
 from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
 from model import LlamaForCausalLM, build_config, estimate_num_parameters, human_readable_count
+from profiler import MemoryTracker, TimerRegistry
 from train import batch_from_chunk, make_data_loader, set_seed
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer
 
@@ -50,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--save-dir", type=str, default="checkpoints")
+    parser.add_argument("--profile-json", type=str, default="")
+    parser.add_argument("--profile-memory-interval", type=int, default=0)
+    parser.add_argument("--profile-rank0-only", action="store_true")
 
     return parser.parse_args()
 
@@ -195,13 +200,27 @@ def train(args: argparse.Namespace) -> None:
     global_tokens_per_step = args.batch_size * args.grad_accum_steps * args.seq_len * world_size
     data_iter: Iterator[torch.Tensor] = iter(loader)
 
+    timers = TimerRegistry(device=device)
+    memory = MemoryTracker(device=device)
+    enable_profile_output = bool(args.profile_json)
+    should_record_memory = args.profile_memory_interval > 0
+    rank_profile_enabled = enable_profile_output and (rank == 0 or not args.profile_rank0_only)
+    step_profiles = []
+
+    if should_record_memory and rank_profile_enabled:
+        memory.record("start")
+
     recent_losses = []
     t_train_start = time.perf_counter()
 
     for step in range(1, args.max_steps + 1):
+        iter_timer = timers.timer("iteration")
+        iter_timer.start()
+
         model.train()
         engine.zero_grad()
-        t_step_start = time.perf_counter()
+        fwd_bwd_timer = timers.timer("forward_backward")
+        fwd_bwd_timer.start()
 
         micro_losses = []
         for _micro in range(args.grad_accum_steps):
@@ -225,13 +244,13 @@ def train(args: argparse.Namespace) -> None:
             micro_losses.append(float(loss.detach().float().item()))
             engine.backward(scaled_loss)
 
-        if args.max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
-            grad_norm_value = float(grad_norm.item())
-        else:
-            grad_norm_value = math.nan
+        fwd_bwd_ms = fwd_bwd_timer.stop()
 
-        engine.step()
+        step_timer = timers.timer("optimizer_step")
+        step_timer.start()
+        step_stats = engine.step_with_stats(max_grad_norm=args.max_grad_norm)
+        _ = step_timer.stop()
+        grad_norm_value = float(step_stats["grad_norm"])
 
         local_step_loss = float(sum(micro_losses) / len(micro_losses))
         step_loss = global_mean_scalar(local_step_loss, device=device, world_size=world_size)
@@ -240,15 +259,35 @@ def train(args: argparse.Namespace) -> None:
         if len(recent_losses) > 100:
             recent_losses.pop(0)
 
-        step_time = time.perf_counter() - t_step_start
+        iter_ms = iter_timer.stop()
+        step_time = iter_ms / 1000.0
         tokens_per_second = global_tokens_per_step / max(step_time, 1e-8)
 
         if rank == 0 and (step % args.log_interval == 0 or step == 1 or step == args.max_steps):
             avg_loss = sum(recent_losses) / len(recent_losses)
             print(
                 f"[step {step:05d}] loss={step_loss:.4f} avg100={avg_loss:.4f} "
-                f"tokens/s={tokens_per_second:,.0f} grad_norm={grad_norm_value:.3f}"
+                f"tokens/s={tokens_per_second:,.0f} grad_norm={grad_norm_value:.3f} "
+                f"fb_ms={fwd_bwd_ms:.2f} comm_ms={step_stats['comm_ms']:.2f} opt_ms={step_stats['optim_ms']:.2f}"
             )
+
+        if rank_profile_enabled:
+            step_profiles.append(
+                {
+                    "step": step,
+                    "loss": step_loss,
+                    "tokens_per_second": tokens_per_second,
+                    "grad_norm": grad_norm_value,
+                    "forward_backward_ms": fwd_bwd_ms,
+                    "communication_ms": float(step_stats["comm_ms"]),
+                    "optimizer_ms": float(step_stats["optim_ms"]),
+                    "iteration_ms": iter_ms,
+                }
+            )
+
+        if should_record_memory and rank_profile_enabled:
+            if step == 1 or step == args.max_steps or step % args.profile_memory_interval == 0:
+                memory.record(f"step_{step}")
 
         if args.checkpoint_interval > 0 and (step % args.checkpoint_interval == 0 or step == args.max_steps):
             path = save_checkpoint(
@@ -266,6 +305,28 @@ def train(args: argparse.Namespace) -> None:
     elapsed = time.perf_counter() - t_train_start
     if rank == 0:
         print(f"[done] trained {args.max_steps} steps in {elapsed:.1f}s")
+
+    if rank_profile_enabled:
+        summaries = timers.summarize()
+        timer_payload = {name: asdict(summary) for name, summary in summaries.items()}
+        profile_payload = {
+            "rank": rank,
+            "world_size": world_size,
+            "stage": args.zero_stage,
+            "collective_impl": args.collective_impl,
+            "args": vars(args),
+            "timers": timer_payload,
+            "memory": memory.as_dicts() if should_record_memory else [],
+            "steps": step_profiles,
+        }
+
+        profile_path = Path(args.profile_json)
+        if world_size > 1 and not args.profile_rank0_only:
+            profile_path = profile_path.with_suffix(f".rank{rank:03d}.json")
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps(profile_payload, indent=2))
+        if rank == 0 or not args.profile_rank0_only:
+            print(f"[profile] wrote {profile_path}")
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

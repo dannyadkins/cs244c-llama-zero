@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -44,11 +45,39 @@ class ZeROStage0DDP:
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
 
-    def step(self) -> None:
+    def _clip_flat_grads_inplace(self, flat_grads: torch.Tensor, max_grad_norm: float) -> float:
+        grad_norm = float(flat_grads.norm(2).item())
+        if max_grad_norm > 0 and grad_norm > max_grad_norm:
+            scale = max_grad_norm / (grad_norm + 1e-6)
+            flat_grads.mul_(scale)
+        return grad_norm
+
+    def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
+        t0 = time.perf_counter()
         flat_grads = flatten_grads_fp32(self.meta)
+
+        t_comm0 = time.perf_counter()
         reduced = self.collectives.allreduce(flat_grads, average=True)
+        comm_ms = (time.perf_counter() - t_comm0) * 1000.0
+
+        grad_norm = self._clip_flat_grads_inplace(reduced, max_grad_norm=max_grad_norm)
+
         assign_flat_grads(self.meta, reduced)
+
+        t_opt0 = time.perf_counter()
         self.optimizer.step()
+        optim_ms = (time.perf_counter() - t_opt0) * 1000.0
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "grad_norm": grad_norm,
+            "comm_ms": comm_ms,
+            "optim_ms": optim_ms,
+            "total_ms": total_ms,
+        }
+
+    def step(self, max_grad_norm: float = 0.0) -> float:
+        return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
 
     def state_dict(self) -> Dict[str, object]:
         return {

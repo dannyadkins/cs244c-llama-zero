@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
@@ -70,23 +72,55 @@ class ZeROStage2Optimizer:
         local_params.addcdiv_(self.exp_avg, denom, value=-step_size)
         return local_params
 
-    def step(self) -> None:
+    def _global_grad_norm(self, local_grads: torch.Tensor) -> float:
+        sum_sq = torch.sum(local_grads * local_grads)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(sum_sq)
+        return float(torch.sqrt(sum_sq).item())
+
+    def _clip_local_grads_inplace(self, local_grads: torch.Tensor, max_grad_norm: float) -> float:
+        grad_norm = self._global_grad_norm(local_grads)
+        if max_grad_norm > 0 and grad_norm > max_grad_norm:
+            scale = max_grad_norm / (grad_norm + 1e-6)
+            local_grads.mul_(scale)
+        return grad_norm
+
+    def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
+        t0 = time.perf_counter()
         flat_params = flatten_params_fp32(self.meta)
         flat_grads = flatten_grads_fp32(self.meta)
 
+        t_comm0 = time.perf_counter()
         reduced_shard = self.collectives.reduce_scatter(flat_grads)
         reduced_shard = reduced_shard / self.world_size
+        comm_ms = (time.perf_counter() - t_comm0) * 1000.0
 
         expected = self.shard.shard_numel
         if reduced_shard.numel() < expected:
             raise ValueError(f"reduce_scatter returned too few elements: {reduced_shard.numel()} < {expected}")
         local_grads = reduced_shard[:expected].clone()
+        grad_norm = self._clip_local_grads_inplace(local_grads, max_grad_norm=max_grad_norm)
 
         local_params = flat_params[self.shard.shard_start : self.shard.shard_end].clone()
+        t_opt0 = time.perf_counter()
         updated_local = self._adamw_update(local_params=local_params, local_grads=local_grads)
+        optim_ms = (time.perf_counter() - t_opt0) * 1000.0
 
+        t_comm1 = time.perf_counter()
         full_updated = self.collectives.allgather(updated_local)
+        comm_ms += (time.perf_counter() - t_comm1) * 1000.0
         assign_flat_params(self.meta, full_updated[: self.meta.total_numel])
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "grad_norm": grad_norm,
+            "comm_ms": comm_ms,
+            "optim_ms": optim_ms,
+            "total_ms": total_ms,
+        }
+
+    def step(self, max_grad_norm: float = 0.0) -> float:
+        return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
 
     def state_dict(self) -> Dict[str, object]:
         return {

@@ -11,6 +11,8 @@ Design goals:
 - Clear flat-parameter metadata in `common.py`
 - Explicit communication boundaries through `CollectiveOps`
 - Minimal hidden magic so stage transitions are easy to audit
+- Deterministic correctness checks against global-batch AdamW reference updates
+- Synchronized-gradient clipping semantics via `step(max_grad_norm=...)`
 
 Usage entrypoint:
 
@@ -28,3 +30,9 @@ torchrun --standalone --nproc_per_node=2 train_zero.py \
   --batch-size 4 \
   --max-steps 50
 ```
+
+Test coverage:
+
+- `zero/tests/test_zero_stages.py` validates stages 0/1/2 against reference optimizer
+- coverage includes `world_size` 2 and 3
+- includes a stage-2 gradient clipping parity check
