@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from collectives import ring_allgather, ring_allreduce, ring_reduce_scatter
+from collectives import TorchCollectives, ring_allgather, ring_allreduce, ring_reduce_scatter
 
 
 pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
@@ -84,6 +84,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         ref = ref_full[start:end]
         _assert_close(custom, ref, msg=f"uneven reduce_scatter mismatch rank={rank}")
 
+        # 3b) uneven reduce_scatter through TorchCollectives wrapper fallback.
+        torch_impl = TorchCollectives()
+        torch_custom = torch_impl.reduce_scatter(x)
+        _assert_close(torch_custom, ref, msg=f"torch fallback reduce_scatter mismatch rank={rank}")
+
         # 4) allgather: fixed-size shards matches dist.all_gather
         for local_size in [8, 127]:
             local = torch.arange(local_size, dtype=torch.float32) + rank * 10
@@ -98,11 +103,14 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         variable_size = 5 + rank
         local = torch.arange(variable_size, dtype=torch.float32) + rank * 100
         custom = ring_allgather(local)
+        torch_impl = TorchCollectives()
+        torch_custom = torch_impl.allgather(local)
 
         objects: List[torch.Tensor | None] = [None for _ in range(world_size)]
         dist.all_gather_object(objects, local)
         ref = torch.cat([obj.view(-1) for obj in objects], dim=0)
         _assert_close(custom, ref, msg=f"variable allgather mismatch rank={rank}")
+        _assert_close(torch_custom, ref, msg=f"torch variable allgather mismatch rank={rank}")
 
     finally:
         dist.barrier()

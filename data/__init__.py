@@ -1,5 +1,6 @@
 from .fineweb import (
     PackedFineWebDataset,
+    RankShardIterableDataset,
     SyntheticPatternDataset,
     TokenizerBundle,
     load_fineweb_stream,
@@ -8,6 +9,7 @@ from .fineweb import (
 
 __all__ = [
     "PackedFineWebDataset",
+    "RankShardIterableDataset",
     "SyntheticPatternDataset",
     "TokenizerBundle",
     "load_fineweb_stream",
