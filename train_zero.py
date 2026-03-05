@@ -224,8 +224,7 @@ def train(args: argparse.Namespace) -> None:
         prepare_comm_ms = 0.0
         if hasattr(engine, "prepare_forward"):
             prepare_stats = engine.prepare_forward()
-            if isinstance(prepare_stats, dict):
-                prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
+            prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
         fwd_bwd_timer = timers.timer("forward_backward")
         fwd_bwd_timer.start()
 

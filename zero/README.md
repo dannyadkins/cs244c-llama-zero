@@ -36,7 +36,7 @@ Test coverage:
 
 - `zero/tests/test_zero_stages.py` validates stages 0/1/2/3 against reference optimizer
 - coverage includes `world_size` 2 and 3
-- includes a stage-2 gradient clipping parity check
+- includes a stage-2 and stage-3 gradient clipping parity check
 
 Note:
 
