@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -180,6 +180,7 @@ class LlamaForCausalLM(nn.Module):
             self.lm_head.weight = self.tok_embeddings.weight
 
         self.apply(self._init_weights)
+        self._zero3_executor = None
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -196,14 +197,14 @@ class LlamaForCausalLM(nn.Module):
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids should have shape [batch, seq], got {tuple(input_ids.shape)}")
 
-        x = self.tok_embeddings(input_ids)
+        x = self._call_parametrized_module("tok_embeddings", self.tok_embeddings, input_ids)
         x = self.dropout(x)
 
-        for layer in self.layers:
-            x = layer(x, attention_mask=attention_mask)
+        for layer_idx, layer in enumerate(self.layers):
+            x = self._call_parametrized_module(f"layers.{layer_idx}", layer, x, attention_mask)
 
-        x = self.norm(x)
-        logits = self.lm_head(x)
+        x = self._call_parametrized_module("norm", self.norm, x)
+        logits = self._call_parametrized_module("lm_head", self.lm_head, x)
 
         loss = None
         if labels is not None:
@@ -220,6 +221,12 @@ class LlamaForCausalLM(nn.Module):
             )
 
         return CausalLMOutput(logits=logits, loss=loss)
+
+    def _call_parametrized_module(self, module_name: str, module: nn.Module, *args: Any) -> torch.Tensor:
+        executor = self._zero3_executor
+        if executor is None:
+            return module(*args)
+        return executor.call_module(module_name, module, *args)
 
     @torch.no_grad()
     def generate(

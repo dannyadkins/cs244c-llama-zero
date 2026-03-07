@@ -5,7 +5,7 @@ Implemented stages:
 - `stage0_ddp.py`: full replication + gradient allreduce + local AdamW step
 - `stage1_optimizer.py`: optimizer-state sharding + gradient allreduce + parameter allgather
 - `stage2_optimizer.py`: optimizer-state sharding + gradient reduce-scatter + parameter allgather
-- `stage3_optimizer.py`: correctness-first stage-3 communication pattern with forward/backward rematerialization accounting + gradient reduce-scatter + sharded optimizer state
+- `stage3_optimizer.py`: module-wise ZeRO-3 with sharded parameter residency, backward recomputation, per-module allgather/reduce-scatter, and sharded optimizer state
 
 Design goals:
 
@@ -22,7 +22,11 @@ Usage entrypoint:
 Example:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
+python3 -m torch.distributed.run \
+  --nproc_per_node=2 \
+  --master_addr=127.0.0.1 \
+  --master_port=29500 \
+  train_zero.py \
   --zero-stage 3 \
   --collective-impl ring \
   --data-mode synthetic \
@@ -40,5 +44,5 @@ Test coverage:
 
 Note:
 
-- Stage 3 here is intentionally correctness-first and explicit: no overlap/prefetch optimizations yet.
-- It is designed to make communication and update semantics auditable before adding performance overlap.
+- Stage 3 now shards parameters between module calls and rematerializes them lazily through the model forward path.
+- It is still correctness-first: no overlap/prefetch optimization yet, but parameter residency now matches the intended ZeRO-3 execution model much more closely.

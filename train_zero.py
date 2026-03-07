@@ -142,10 +142,13 @@ def save_checkpoint(
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"zero_stage{args.zero_stage}_step{step:06d}_rank{rank:03d}.pt")
+    summon_ctx = engine.summon_full_params() if hasattr(engine, "summon_full_params") else nullcontext()
+    with summon_ctx:
+        model_state_dict = model.state_dict()
     payload = {
         "step": step,
         "rank": rank,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_state_dict,
         "engine_state_dict": engine.state_dict(),
         "train_args": vars(args),
         "extra": extra,

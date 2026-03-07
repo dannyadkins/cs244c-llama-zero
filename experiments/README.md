@@ -1,6 +1,7 @@
 # Experiments
 
 `harness.py` runs ZeRO experiment matrices and writes per-case logs, profiles, and summary JSON.
+It launches distributed jobs through the current Python interpreter (`python -m torch.distributed.run`) with explicit master address/port assignment, so it does not depend on a separate `torchrun` binary being on `PATH`.
 
 ## Quick Start
 
@@ -12,7 +13,7 @@ Outputs are written under `experiments/results/<name>/`:
 
 - `summary.json`: run-level metadata + all case results
 - `cases/<case_id>.json`: idempotent per-case result payload
-- `logs/<case_id>.log`: stdout/stderr from `torchrun`
+- `logs/<case_id>.log`: stdout/stderr from the launched distributed job
 - `profiles/<case_id>.json`: per-step profiler output from rank 0 (default)
 
 Each case JSON also includes a theoretical state-memory breakdown (`params_mb`, `grads_mb`, `optimizer_mb`, `total_mb`) computed from model size and ZeRO stage.
@@ -27,6 +28,9 @@ python3 experiments/harness.py \
   --bandwidth-gbps 0 1 2.5 5 10 25 50 \
   --bandwidth-mode simulated \
   --nproc-per-node 2 \
+  --master-addr 127.0.0.1 \
+  --master-port-base 29500 \
+  --case-timeout-s 1800 \
   --steps 100
 ```
 
@@ -53,3 +57,9 @@ Example files:
 ## Idempotency
 
 Use `--skip-existing` to reuse completed per-case JSON records and rerun only missing/failed cases.
+
+## Launch Notes
+
+- Single-node runs default to `--master-addr 127.0.0.1`, which avoids brittle hostname-based rendezvous.
+- `--master-port-base` allocates one port per case in the sweep (`base + case_index`).
+- `--case-timeout-s` marks hung cases as failed instead of blocking the full matrix indefinitely.

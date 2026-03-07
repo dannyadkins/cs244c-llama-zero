@@ -85,7 +85,11 @@ python3 train.py \
 ## ZeRO Training (Stages 0-3)
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
+python3 -m torch.distributed.run \
+  --nproc_per_node=2 \
+  --master_addr=127.0.0.1 \
+  --master_port=29500 \
+  train_zero.py \
   --zero-stage 3 \
   --collective-impl ring \
   --data-mode synthetic \
