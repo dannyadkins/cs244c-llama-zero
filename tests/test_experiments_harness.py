@@ -71,6 +71,44 @@ def test_parse_step_metrics_extracts_means() -> None:
     assert metrics["mean_opt_ms"] == 3.0
 
 
+def test_parse_profile_memory_extracts_peaks(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "memory": [
+                    {
+                        "label": "start",
+                        "host_maxrss_mb": 100.0,
+                        "cuda_allocated_mb": 10.0,
+                        "cuda_reserved_mb": 20.0,
+                        "cuda_max_allocated_mb": 30.0,
+                        "cuda_max_reserved_mb": 40.0,
+                    },
+                    {
+                        "label": "end",
+                        "host_maxrss_mb": 150.0,
+                        "cuda_allocated_mb": 12.0,
+                        "cuda_reserved_mb": 18.0,
+                        "cuda_max_allocated_mb": 35.0,
+                        "cuda_max_reserved_mb": 45.0,
+                    },
+                ]
+            }
+        )
+    )
+
+    metrics = harness._parse_profile_memory(profile_path)
+
+    assert metrics == {
+        "peak_host_rss_mb": 150.0,
+        "peak_cuda_allocated_mb": 12.0,
+        "peak_cuda_reserved_mb": 20.0,
+        "peak_cuda_max_allocated_mb": 35.0,
+        "peak_cuda_max_reserved_mb": 45.0,
+    }
+
+
 def test_merge_config_file_overrides_defaults_and_matrix(tmp_path: Path) -> None:
     cfg = {
         "defaults": {
@@ -183,3 +221,61 @@ def test_run_case_timeout_records_failure(tmp_path: Path, monkeypatch) -> None:
     assert "timeout" in Path(result.log_path).read_text()
     assert Path(result.profile_path).name.endswith(".json")
     assert Path(tmp_path / "cases" / f"{result.case_id}.json").exists()
+
+
+def test_run_case_records_profile_memory_metrics(tmp_path: Path, monkeypatch) -> None:
+    args = _base_args()
+    args.profile_memory_interval = 1
+    case = harness._build_cases(args)[0]
+    launch = harness._launch_config_from_args(args)
+
+    def fake_run(cmd, capture_output, text, env, cwd, timeout):
+        profile_path = Path(cmd[cmd.index("--profile-json") + 1])
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "memory": [
+                        {
+                            "label": "step0",
+                            "host_maxrss_mb": 200.0,
+                            "cuda_allocated_mb": 1.0,
+                            "cuda_reserved_mb": 2.0,
+                            "cuda_max_allocated_mb": 3.0,
+                            "cuda_max_reserved_mb": 4.0,
+                        },
+                        {
+                            "label": "step1",
+                            "host_maxrss_mb": 250.0,
+                            "cuda_allocated_mb": 1.5,
+                            "cuda_reserved_mb": 2.5,
+                            "cuda_max_allocated_mb": 3.5,
+                            "cuda_max_reserved_mb": 4.5,
+                        },
+                    ]
+                }
+            )
+        )
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="[step 00001] loss=8.1000 avg100=8.1000 tokens/s=1,200 grad_norm=0.900 fb_ms=10.0 comm_ms=5.0 opt_ms=2.0\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+
+    result = harness._run_case(
+        case=case,
+        run_dir=tmp_path,
+        skip_existing=False,
+        dry_run=False,
+        launch=launch,
+        case_index=0,
+    )
+
+    assert result.return_code == 0
+    assert result.peak_host_rss_mb == 250.0
+    assert result.peak_cuda_allocated_mb == 1.5
+    assert result.peak_cuda_reserved_mb == 2.5
+    assert result.peak_cuda_max_allocated_mb == 3.5
+    assert result.peak_cuda_max_reserved_mb == 4.5

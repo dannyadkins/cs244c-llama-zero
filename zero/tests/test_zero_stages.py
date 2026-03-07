@@ -251,3 +251,76 @@ def _stage3_dropout_worker(rank: int, world_size: int, port: int) -> None:
 def test_stage3_matches_stage0_with_dropout_world2() -> None:
     port = _find_free_port()
     mp.spawn(_stage3_dropout_worker, args=(2, port), nprocs=2, join=True)
+
+
+def _stage3_checkpoint_restore_worker(rank: int, world_size: int, port: int) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        cfg = _test_config()
+        torch.manual_seed(2024)
+
+        kwargs = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.01}
+
+        model_src = LlamaForCausalLM(cfg)
+        for param in model_src.parameters():
+            dist.broadcast(param.data, src=0)
+        engine_src = ZeROStage3Optimizer(model=model_src, **kwargs)
+
+        for step in range(2):
+            local_ids = _local_batch(
+                step=step,
+                rank=rank,
+                batch_size=3,
+                seq_len=cfg.max_seq_len,
+                vocab_size=cfg.vocab_size,
+            )
+            engine_src.zero_grad()
+            engine_src.prepare_forward()
+            loss = model_src(input_ids=local_ids, labels=local_ids).loss
+            assert loss is not None
+            engine_src.backward(loss)
+            engine_src.step(max_grad_norm=0.25)
+
+        saved_engine_state = engine_src.state_dict()
+
+        torch.manual_seed(9999)
+        model_restored = LlamaForCausalLM(cfg)
+        engine_restored = ZeROStage3Optimizer(model=model_restored, **kwargs)
+        engine_restored.load_state_dict(saved_engine_state)
+
+        assert engine_restored.step_count == engine_src.step_count
+
+        with engine_src.summon_full_params(), engine_restored.summon_full_params():
+            _assert_models_close(model_restored, model_src, msg=f"stage3 restore rank={rank}")
+
+        next_ids = _local_batch(
+            step=7,
+            rank=rank,
+            batch_size=3,
+            seq_len=cfg.max_seq_len,
+            vocab_size=cfg.vocab_size,
+        )
+        for model, engine in ((model_src, engine_src), (model_restored, engine_restored)):
+            engine.zero_grad()
+            engine.prepare_forward()
+            loss = model(input_ids=next_ids, labels=next_ids).loss
+            assert loss is not None
+            engine.backward(loss)
+            engine.step(max_grad_norm=0.25)
+
+        with engine_src.summon_full_params(), engine_restored.summon_full_params():
+            _assert_models_close(model_restored, model_src, msg=f"stage3 restore continue rank={rank}")
+    finally:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def test_stage3_checkpoint_restore_world2() -> None:
+    port = _find_free_port()
+    mp.spawn(_stage3_checkpoint_restore_worker, args=(2, port), nprocs=2, join=True)

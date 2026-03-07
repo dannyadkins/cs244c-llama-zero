@@ -17,6 +17,7 @@ Outputs are written under `experiments/results/<name>/`:
 - `profiles/<case_id>.json`: per-step profiler output from rank 0 (default)
 
 Each case JSON also includes a theoretical state-memory breakdown (`params_mb`, `grads_mb`, `optimizer_mb`, `total_mb`) computed from model size and ZeRO stage.
+If the training command records memory snapshots (`--profile-memory-interval > 0`), the harness also extracts peak host/CUDA memory fields into each case result in `summary.json`.
 
 ## CLI Matrix Example
 
@@ -31,6 +32,7 @@ python3 experiments/harness.py \
   --master-addr 127.0.0.1 \
   --master-port-base 29500 \
   --case-timeout-s 1800 \
+  --profile-memory-interval 1 \
   --steps 100
 ```
 

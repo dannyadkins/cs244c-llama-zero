@@ -64,6 +64,11 @@ class CaseResult:
     mean_comm_ms: float | None
     mean_fb_ms: float | None
     mean_opt_ms: float | None
+    peak_host_rss_mb: float | None
+    peak_cuda_allocated_mb: float | None
+    peak_cuda_reserved_mb: float | None
+    peak_cuda_max_allocated_mb: float | None
+    peak_cuda_max_reserved_mb: float | None
     theoretical_param_count: int
     theoretical_memory_mb: Dict[str, float]
     notes: str = ""
@@ -267,6 +272,40 @@ def _parse_step_metrics(log_text: str) -> Dict[str, object]:
     }
 
 
+def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
+    if not profile_path.exists():
+        return {
+            "peak_host_rss_mb": None,
+            "peak_cuda_allocated_mb": None,
+            "peak_cuda_reserved_mb": None,
+            "peak_cuda_max_allocated_mb": None,
+            "peak_cuda_max_reserved_mb": None,
+        }
+
+    payload = json.loads(profile_path.read_text())
+    snapshots = payload.get("memory", [])
+    if not snapshots:
+        return {
+            "peak_host_rss_mb": None,
+            "peak_cuda_allocated_mb": None,
+            "peak_cuda_reserved_mb": None,
+            "peak_cuda_max_allocated_mb": None,
+            "peak_cuda_max_reserved_mb": None,
+        }
+
+    def peak(key: str) -> float | None:
+        values = [float(snapshot[key]) for snapshot in snapshots if key in snapshot]
+        return max(values) if values else None
+
+    return {
+        "peak_host_rss_mb": peak("host_maxrss_mb"),
+        "peak_cuda_allocated_mb": peak("cuda_allocated_mb"),
+        "peak_cuda_reserved_mb": peak("cuda_reserved_mb"),
+        "peak_cuda_max_allocated_mb": peak("cuda_max_allocated_mb"),
+        "peak_cuda_max_reserved_mb": peak("cuda_max_reserved_mb"),
+    }
+
+
 def _apply_tc(case: CaseConfig) -> None:
     rate = f"{case.bandwidth_gbps:g}gbit"
     subprocess.run(
@@ -420,6 +459,11 @@ def _run_case(
             mean_comm_ms=None,
             mean_fb_ms=None,
             mean_opt_ms=None,
+            peak_host_rss_mb=None,
+            peak_cuda_allocated_mb=None,
+            peak_cuda_reserved_mb=None,
+            peak_cuda_max_allocated_mb=None,
+            peak_cuda_max_reserved_mb=None,
             theoretical_param_count=num_params,
             theoretical_memory_mb=memory_mb,
             notes="dry_run",
@@ -457,6 +501,7 @@ def _run_case(
     log_path.write_text(log_text)
 
     metrics = _parse_step_metrics(log_text)
+    memory_metrics = _parse_profile_memory(profile_path)
     num_params, memory_mb = _theoretical_memory(case)
 
     result = CaseResult(
@@ -473,6 +518,11 @@ def _run_case(
         mean_comm_ms=metrics["mean_comm_ms"],
         mean_fb_ms=metrics["mean_fb_ms"],
         mean_opt_ms=metrics["mean_opt_ms"],
+        peak_host_rss_mb=memory_metrics["peak_host_rss_mb"],
+        peak_cuda_allocated_mb=memory_metrics["peak_cuda_allocated_mb"],
+        peak_cuda_reserved_mb=memory_metrics["peak_cuda_reserved_mb"],
+        peak_cuda_max_allocated_mb=memory_metrics["peak_cuda_max_allocated_mb"],
+        peak_cuda_max_reserved_mb=memory_metrics["peak_cuda_max_reserved_mb"],
         theoretical_param_count=num_params,
         theoretical_memory_mb=memory_mb,
         notes=notes,
