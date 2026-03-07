@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -63,9 +64,23 @@ class CaseResult:
     mean_comm_ms: float | None
     mean_fb_ms: float | None
     mean_opt_ms: float | None
+    peak_host_rss_mb: float | None
+    peak_cuda_allocated_mb: float | None
+    peak_cuda_reserved_mb: float | None
+    peak_cuda_max_allocated_mb: float | None
+    peak_cuda_max_reserved_mb: float | None
     theoretical_param_count: int
     theoretical_memory_mb: Dict[str, float]
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class LaunchConfig:
+    nnodes: int
+    node_rank: int
+    master_addr: str
+    master_port_base: int
+    case_timeout_s: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bandwidth-gbps", nargs="+", type=float, default=[0.0])
 
     parser.add_argument("--nproc-per-node", type=int, default=2)
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--master-addr", type=str, default="127.0.0.1")
+    parser.add_argument("--master-port-base", type=int, default=29500)
+    parser.add_argument("--case-timeout-s", type=float, default=1800.0)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -136,6 +156,16 @@ def _case_id(case: CaseConfig) -> str:
     return (
         f"s{case.stage}_m{case.model_size}_bw{bw}_np{case.nproc_per_node}_"
         f"sl{case.seq_len}_bs{case.batch_size}_ga{case.grad_accum_steps}_seed{case.seed}"
+    )
+
+
+def _launch_config_from_args(args: argparse.Namespace) -> LaunchConfig:
+    return LaunchConfig(
+        nnodes=int(args.nnodes),
+        node_rank=int(args.node_rank),
+        master_addr=str(args.master_addr),
+        master_port_base=int(args.master_port_base),
+        case_timeout_s=float(args.case_timeout_s),
     )
 
 
@@ -242,38 +272,98 @@ def _parse_step_metrics(log_text: str) -> Dict[str, object]:
     }
 
 
+def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
+    if not profile_path.exists():
+        return {
+            "peak_host_rss_mb": None,
+            "peak_cuda_allocated_mb": None,
+            "peak_cuda_reserved_mb": None,
+            "peak_cuda_max_allocated_mb": None,
+            "peak_cuda_max_reserved_mb": None,
+        }
+
+    payload = json.loads(profile_path.read_text())
+    snapshots = payload.get("memory", [])
+    if not snapshots:
+        return {
+            "peak_host_rss_mb": None,
+            "peak_cuda_allocated_mb": None,
+            "peak_cuda_reserved_mb": None,
+            "peak_cuda_max_allocated_mb": None,
+            "peak_cuda_max_reserved_mb": None,
+        }
+
+    def peak(key: str) -> float | None:
+        values = [float(snapshot[key]) for snapshot in snapshots if key in snapshot]
+        return max(values) if values else None
+
+    return {
+        "peak_host_rss_mb": peak("host_maxrss_mb"),
+        "peak_cuda_allocated_mb": peak("cuda_allocated_mb"),
+        "peak_cuda_reserved_mb": peak("cuda_reserved_mb"),
+        "peak_cuda_max_allocated_mb": peak("cuda_max_allocated_mb"),
+        "peak_cuda_max_reserved_mb": peak("cuda_max_reserved_mb"),
+    }
+
+
 def _apply_tc(case: CaseConfig) -> None:
     rate = f"{case.bandwidth_gbps:g}gbit"
-    subprocess.run(["./infra/throttle.sh", "apply", case.tc_interface, rate, "1mb", "10ms"], check=True)
+    subprocess.run(
+        [str(PROJECT_ROOT / "infra" / "throttle.sh"), "apply", case.tc_interface, rate, "1mb", "10ms"],
+        check=True,
+        cwd=PROJECT_ROOT,
+    )
 
 
 def _clear_tc(case: CaseConfig) -> None:
-    subprocess.run(["./infra/throttle.sh", "delete", case.tc_interface], check=False)
+    subprocess.run(
+        [str(PROJECT_ROOT / "infra" / "throttle.sh"), "delete", case.tc_interface],
+        check=False,
+        cwd=PROJECT_ROOT,
+    )
 
 
-def _run_case(case: CaseConfig, run_dir: Path, skip_existing: bool, dry_run: bool) -> CaseResult:
-    case_id = _case_id(case)
-    case_dir = run_dir / "cases"
-    case_dir.mkdir(parents=True, exist_ok=True)
+def _master_port_for_case(launch: LaunchConfig, case_index: int) -> int:
+    return launch.master_port_base + case_index
 
-    case_result_path = case_dir / f"{case_id}.json"
-    if skip_existing and case_result_path.exists():
-        payload = json.loads(case_result_path.read_text())
-        return CaseResult(**payload)
 
-    logs_dir = run_dir / "logs"
-    profiles_dir = run_dir / "profiles"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    profiles_dir.mkdir(parents=True, exist_ok=True)
+def _build_launch_env(case: CaseConfig) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env.pop("ZERO_SIM_BW_GBPS", None)
+    env.pop("ZERO_SIM_LATENCY_MS", None)
 
-    log_path = logs_dir / f"{case_id}.log"
-    profile_path = profiles_dir / f"{case_id}.json"
+    if case.bandwidth_mode == "simulated":
+        if case.bandwidth_gbps > 0:
+            env["ZERO_SIM_BW_GBPS"] = str(case.bandwidth_gbps)
+        else:
+            env.pop("ZERO_SIM_BW_GBPS", None)
 
+        if case.sim_latency_ms > 0:
+            env["ZERO_SIM_LATENCY_MS"] = str(case.sim_latency_ms)
+        else:
+            env.pop("ZERO_SIM_LATENCY_MS", None)
+
+    return env
+
+
+def _build_train_zero_cmd(case: CaseConfig, profile_path: Path, launch: LaunchConfig, case_index: int) -> List[str]:
+    master_port = _master_port_for_case(launch=launch, case_index=case_index)
     cmd = [
-        "torchrun",
-        "--standalone",
-        f"--nproc_per_node={case.nproc_per_node}",
-        "train_zero.py",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes",
+        str(launch.nnodes),
+        "--node_rank",
+        str(launch.node_rank),
+        "--nproc_per_node",
+        str(case.nproc_per_node),
+        "--master_addr",
+        launch.master_addr,
+        "--master_port",
+        str(master_port),
+        str(PROJECT_ROOT / "train_zero.py"),
         "--zero-stage",
         str(case.stage),
         "--collective-impl",
@@ -311,18 +401,46 @@ def _run_case(case: CaseConfig, run_dir: Path, skip_existing: bool, dry_run: boo
     if case.extra_args.strip():
         cmd.extend(shlex.split(case.extra_args))
 
-    env = os.environ.copy()
-    if case.bandwidth_mode == "simulated":
-        if case.bandwidth_gbps > 0:
-            env["ZERO_SIM_BW_GBPS"] = str(case.bandwidth_gbps)
-        else:
-            env.pop("ZERO_SIM_BW_GBPS", None)
+    return cmd
 
-        if case.sim_latency_ms > 0:
-            env["ZERO_SIM_LATENCY_MS"] = str(case.sim_latency_ms)
-        else:
-            env.pop("ZERO_SIM_LATENCY_MS", None)
 
+def _combine_process_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    def _to_text(value: str | bytes | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value
+
+    return _to_text(stdout) + "\n" + _to_text(stderr)
+
+
+def _run_case(
+    case: CaseConfig,
+    run_dir: Path,
+    skip_existing: bool,
+    dry_run: bool,
+    launch: LaunchConfig,
+    case_index: int,
+) -> CaseResult:
+    case_id = _case_id(case)
+    case_dir = run_dir / "cases"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    case_result_path = case_dir / f"{case_id}.json"
+    if skip_existing and case_result_path.exists():
+        payload = json.loads(case_result_path.read_text())
+        return CaseResult(**payload)
+
+    logs_dir = run_dir / "logs"
+    profiles_dir = run_dir / "profiles"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = logs_dir / f"{case_id}.log"
+    profile_path = profiles_dir / f"{case_id}.json"
+    cmd = _build_train_zero_cmd(case=case, profile_path=profile_path, launch=launch, case_index=case_index)
+    env = _build_launch_env(case)
     command_str = " ".join(shlex.quote(x) for x in cmd)
 
     if dry_run:
@@ -341,6 +459,11 @@ def _run_case(case: CaseConfig, run_dir: Path, skip_existing: bool, dry_run: boo
             mean_comm_ms=None,
             mean_fb_ms=None,
             mean_opt_ms=None,
+            peak_host_rss_mb=None,
+            peak_cuda_allocated_mb=None,
+            peak_cuda_reserved_mb=None,
+            peak_cuda_max_allocated_mb=None,
+            peak_cuda_max_reserved_mb=None,
             theoretical_param_count=num_params,
             theoretical_memory_mb=memory_mb,
             notes="dry_run",
@@ -353,25 +476,39 @@ def _run_case(case: CaseConfig, run_dir: Path, skip_existing: bool, dry_run: boo
         _apply_tc(case)
 
     t0 = time.perf_counter()
+    notes = ""
     try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=PROJECT_ROOT,
+            timeout=launch.case_timeout_s if launch.case_timeout_s > 0 else None,
+        )
+        log_text = _combine_process_output(completed.stdout, completed.stderr)
+        return_code = completed.returncode
+    except subprocess.TimeoutExpired as exc:
+        log_text = _combine_process_output(exc.stdout, exc.stderr)
+        log_text += f"\n[harness] timeout after {launch.case_timeout_s:.1f}s\n"
+        return_code = 124
+        notes = f"timeout_after_s={launch.case_timeout_s:.1f}"
     finally:
         if use_tc:
             _clear_tc(case)
 
     elapsed_s = time.perf_counter() - t0
-
-    log_text = completed.stdout + "\n" + completed.stderr
     log_path.write_text(log_text)
 
     metrics = _parse_step_metrics(log_text)
+    memory_metrics = _parse_profile_memory(profile_path)
     num_params, memory_mb = _theoretical_memory(case)
 
     result = CaseResult(
         case_id=case_id,
         config=asdict(case),
         command=command_str,
-        return_code=completed.returncode,
+        return_code=return_code,
         elapsed_s=elapsed_s,
         log_path=str(log_path),
         profile_path=str(profile_path),
@@ -381,8 +518,14 @@ def _run_case(case: CaseConfig, run_dir: Path, skip_existing: bool, dry_run: boo
         mean_comm_ms=metrics["mean_comm_ms"],
         mean_fb_ms=metrics["mean_fb_ms"],
         mean_opt_ms=metrics["mean_opt_ms"],
+        peak_host_rss_mb=memory_metrics["peak_host_rss_mb"],
+        peak_cuda_allocated_mb=memory_metrics["peak_cuda_allocated_mb"],
+        peak_cuda_reserved_mb=memory_metrics["peak_cuda_reserved_mb"],
+        peak_cuda_max_allocated_mb=memory_metrics["peak_cuda_max_allocated_mb"],
+        peak_cuda_max_reserved_mb=memory_metrics["peak_cuda_max_reserved_mb"],
         theoretical_param_count=num_params,
         theoretical_memory_mb=memory_mb,
+        notes=notes,
     )
 
     case_result_path.write_text(json.dumps(asdict(result), indent=2))
@@ -405,6 +548,10 @@ def _build_summary(results: List[CaseResult], args: argparse.Namespace) -> Dict[
 
 def main() -> None:
     args = _merge_config_file(parse_args())
+    launch = _launch_config_from_args(args)
+
+    if shutil.which("tc") is None and args.bandwidth_mode == "tc":
+        raise FileNotFoundError("bandwidth mode 'tc' requires the 'tc' command to be installed")
 
     run_dir = Path(args.results_dir) / args.name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -416,7 +563,14 @@ def main() -> None:
     for idx, case in enumerate(cases, start=1):
         case_id = _case_id(case)
         print(f"[harness] ({idx}/{len(cases)}) {case_id}")
-        result = _run_case(case=case, run_dir=run_dir, skip_existing=args.skip_existing, dry_run=args.dry_run)
+        result = _run_case(
+            case=case,
+            run_dir=run_dir,
+            skip_existing=args.skip_existing,
+            dry_run=args.dry_run,
+            launch=launch,
+            case_index=idx - 1,
+        )
         results.append(result)
         if result.return_code != 0:
             print(f"[harness] case failed: {case_id} (see {result.log_path})")

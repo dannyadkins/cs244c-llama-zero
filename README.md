@@ -2,6 +2,8 @@
 
 This repository now contains the Week 1 foundation, Week 2 ZeRO stages 0-2 integration, and Week 3 Stage 3 + experiment harness/analysis tooling.
 
+For the current handoff status and exact remaining execution plan, read `PROJECT_STATUS.md`.
+
 ## Implemented Scope
 
 ### Week 1 Person A
@@ -28,13 +30,13 @@ This repository now contains the Week 1 foundation, Week 2 ZeRO stages 0-2 integ
 
 ### Week 3 (ZeRO 3 + Harness)
 
-- `zero/stage3_optimizer.py`: correctness-first Stage 3 communication pattern
+- `zero/stage3_optimizer.py`: module-wise Stage 3 parameter sharding/materialization with backward recomputation
 - `train_zero.py --zero-stage 3` integration
 - `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
 - Simulated bandwidth mode via env-driven collective delay (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
 - Optional `tc` throttling mode integration in harness
-- Per-case theoretical state-memory breakdown (params/grads/optimizer by stage)
-- `analysis/visualize.py`: plots for throughput/communication vs bandwidth and loss curves
+- Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
+- `analysis/visualize.py`: plots for throughput/communication vs bandwidth, loss curves, and measured/theoretical memory
 
 ## Repository Layout
 
@@ -85,7 +87,11 @@ python3 train.py \
 ## ZeRO Training (Stages 0-3)
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train_zero.py \
+python3 -m torch.distributed.run \
+  --nproc_per_node=2 \
+  --master_addr=127.0.0.1 \
+  --master_port=29500 \
+  train_zero.py \
   --zero-stage 3 \
   --collective-impl ring \
   --data-mode synthetic \
@@ -157,6 +163,26 @@ python3 analysis/visualize.py \
   --run-dir experiments/results/week3_medium_bandwidth \
   --plot loss \
   --output analysis/figures/week3_loss_curves.png
+```
+
+Measured peak memory by stage:
+
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/week3_medium_bandwidth \
+  --plot memory \
+  --bandwidth-gbps-filter 0 \
+  --output analysis/figures/week3_peak_memory.png
+```
+
+Theoretical state memory by stage:
+
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/week3_medium_bandwidth \
+  --plot theory-memory \
+  --bandwidth-gbps-filter 0 \
+  --output analysis/figures/week3_theory_memory.png
 ```
 
 ## Bandwidth Control (`tc`)

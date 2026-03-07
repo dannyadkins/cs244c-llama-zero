@@ -46,7 +46,9 @@ done
 echo "[launch] nnodes=$NNODES node_rank=$NODE_RANK nproc_per_node=$NPROC_PER_NODE master=$MASTER_ADDR:$MASTER_PORT"
 echo "[launch] script=$SCRIPT"
 
-torchrun \
+PYTHON_BIN="${PYTHON:-python3}"
+
+"$PYTHON_BIN" -m torch.distributed.run \
   --nnodes "$NNODES" \
   --node_rank "$NODE_RANK" \
   --nproc_per_node "$NPROC_PER_NODE" \

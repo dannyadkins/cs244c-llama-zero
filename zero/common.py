@@ -13,6 +13,7 @@ import torch.distributed as dist
 class FlatParamMetadata:
     params: List[nn.Parameter]
     offsets: List[int]
+    shapes: List[torch.Size]
     total_numel: int
     device: torch.device
 
@@ -33,23 +34,44 @@ def get_rank_world_size() -> Tuple[int, int]:
     return 0, 1
 
 
-def build_flat_param_metadata(model: nn.Module) -> FlatParamMetadata:
-    params = [p for p in model.parameters() if p.requires_grad]
+def unique_trainable_params(params: List[nn.Parameter]) -> List[nn.Parameter]:
+    unique: List[nn.Parameter] = []
+    seen = set()
+    for p in params:
+        if not p.requires_grad:
+            continue
+        ident = id(p)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        unique.append(p)
+    return unique
+
+
+def build_flat_param_metadata_from_params(params: List[nn.Parameter]) -> FlatParamMetadata:
+    params = unique_trainable_params(params)
     if not params:
         raise ValueError("Model has no trainable parameters")
 
     offsets: List[int] = []
+    shapes: List[torch.Size] = []
     cursor = 0
     for p in params:
         offsets.append(cursor)
+        shapes.append(torch.Size(p.shape))
         cursor += p.numel()
 
     return FlatParamMetadata(
         params=params,
         offsets=offsets,
+        shapes=shapes,
         total_numel=cursor,
         device=params[0].device,
     )
+
+
+def build_flat_param_metadata(model: nn.Module) -> FlatParamMetadata:
+    return build_flat_param_metadata_from_params(list(model.parameters()))
 
 
 def compute_shard_spec(total_numel: int, rank: int, world_size: int) -> ShardSpec:
@@ -85,21 +107,20 @@ def assign_flat_params(meta: FlatParamMetadata, flat_params: torch.Tensor) -> No
     if flat_params.numel() < meta.total_numel:
         raise ValueError(f"flat_params too small: {flat_params.numel()} < {meta.total_numel}")
 
-    for p, start in zip(meta.params, meta.offsets):
-        end = start + p.numel()
-        chunk = flat_params[start:end].view_as(p)
-        p.data.copy_(chunk.to(dtype=p.dtype, device=p.device))
+    for p, start, shape in zip(meta.params, meta.offsets, meta.shapes):
+        numel = math.prod(shape)
+        chunk = flat_params[start : start + numel].view(shape)
+        p.data = chunk.to(dtype=p.dtype, device=p.device).clone()
 
 
 def assign_flat_grads(meta: FlatParamMetadata, flat_grads: torch.Tensor) -> None:
     if flat_grads.numel() < meta.total_numel:
         raise ValueError(f"flat_grads too small: {flat_grads.numel()} < {meta.total_numel}")
 
-    for p, start in zip(meta.params, meta.offsets):
-        end = start + p.numel()
-        chunk = flat_grads[start:end].view_as(p).to(dtype=p.dtype, device=p.device)
-        if p.grad is None:
+    for p, start, shape in zip(meta.params, meta.offsets, meta.shapes):
+        numel = math.prod(shape)
+        chunk = flat_grads[start : start + numel].view(shape).to(dtype=p.dtype, device=p.device)
+        if p.grad is None or p.grad.shape != shape:
             p.grad = chunk.clone()
         else:
             p.grad.copy_(chunk)
-
