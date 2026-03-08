@@ -8,8 +8,9 @@ experiments/results/*.json
 .venv/
 venv/
 
-# experiments intermediate
-results/
-logs/
-cases/
-*.png
+# temp experiment data
+experiments/results/*
+experiments/configs/*
+analysis/figures/*
+
+
