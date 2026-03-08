@@ -28,6 +28,7 @@ class CaseView:
     peak_cuda_max_reserved_mb: float | None
     final_loss: float | None
     return_code: int
+    measured_state_memory_mb: Dict[str, float] | None
     theoretical_memory_mb: Dict[str, float] | None
 
 
@@ -38,8 +39,8 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         type=str,
         default="throughput",
-        choices=["loss", "throughput", "comm", "stage-throughput", "stage-comm", "memory", "theory-memory"],
-        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, measured peak memory, or theoretical memory",
+        choices=["loss", "throughput", "comm", "stage-throughput", "stage-comm", "memory", "peak-memory"],
+        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, measured state memory, or measured peak memory",
     )
     parser.add_argument("--output", type=str, default="analysis/figures/week3_plot.png")
     parser.add_argument("--model-size", type=str, default="", help="Optional filter for one model size")
@@ -104,6 +105,7 @@ def parse_summary(summary_path: Path) -> List[CaseView]:
                 peak_cuda_max_reserved_mb=_as_optional_float(result.get("peak_cuda_max_reserved_mb")),
                 final_loss=_as_optional_float(result.get("final_loss")),
                 return_code=int(result.get("return_code", 0)),
+                measured_state_memory_mb=_as_optional_memory(result.get("measured_state_memory_mb")),
                 theoretical_memory_mb=_as_optional_memory(result.get("theoretical_memory_mb")),
             )
         )
@@ -291,6 +293,53 @@ def plot_stage_metric(cases: List[CaseView], metric: str, output: Path) -> None:
     plt.savefig(output)
 
 
+def plot_measured_state_memory(cases: List[CaseView], output: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
+
+    selected = _representative_cases_by_stage(case for case in cases if case.return_code == 0 and case.measured_state_memory_mb is not None)
+    if not selected:
+        raise RuntimeError("No measured state memory data available in the selected cases")
+
+    stages = [case.stage for case in selected]
+    params = [case.measured_state_memory_mb["params_mb"] for case in selected]
+    grads = [case.measured_state_memory_mb["grads_mb"] for case in selected]
+    optimizer = [case.measured_state_memory_mb["optimizer_mb"] for case in selected]
+
+    plt.figure(figsize=(8, 5))
+    bars_params = plt.bar(stages, params, label="params", color="#315A9A")
+    bars_grads = plt.bar(stages, grads, bottom=params, label="grads", color="#4E8A3A")
+    bottoms = [p + g for p, g in zip(params, grads)]
+    bars_optimizer = plt.bar(stages, optimizer, bottom=bottoms, label="optimizer", color="#C56B1A")
+    plt.xticks(stages, [f"stage {stage}" for stage in stages])
+    plt.ylabel("State memory (MB)")
+    plt.title("Measured ZeRO State Memory by Stage")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.legend()
+
+    for bars, values, base_values in [
+        (bars_params, params, [0.0 for _ in params]),
+        (bars_grads, grads, params),
+        (bars_optimizer, optimizer, bottoms),
+    ]:
+        for bar, value, base in zip(bars, values, base_values):
+            if value < 80.0:
+                continue
+            x = bar.get_x() + bar.get_width() / 2.0
+            y = base + value / 2.0
+            plt.text(x, y, f"{value:.0f}", ha="center", va="center", color="white", fontsize=8)
+
+    totals = [p + g + o for p, g, o in zip(params, grads, optimizer)]
+    for stage, total in zip(stages, totals):
+        plt.text(stage, total + max(totals) * 0.015, f"{total:.0f} MB", ha="center", va="bottom", fontsize=8)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output)
+
+
 def plot_peak_memory(cases: List[CaseView], output: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -314,38 +363,8 @@ def plot_peak_memory(cases: List[CaseView], output: Path) -> None:
     plt.bar(stages, values, color="#2E5EAA")
     plt.xticks(stages, [f"stage {stage}" for stage in stages])
     plt.ylabel("Peak memory (MB)")
-    plt.title("Measured Peak Memory by ZeRO Stage")
+    plt.title("Measured Peak Allocated Memory by ZeRO Stage")
     plt.grid(True, axis="y", alpha=0.3)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(output)
-
-
-def plot_theoretical_memory(cases: List[CaseView], output: Path) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
-
-    selected = _representative_cases_by_stage(case for case in cases if case.theoretical_memory_mb is not None)
-    if not selected:
-        raise RuntimeError("No theoretical memory data available in the selected cases")
-
-    stages = [case.stage for case in selected]
-    params = [case.theoretical_memory_mb["params_mb"] for case in selected]
-    grads = [case.theoretical_memory_mb["grads_mb"] for case in selected]
-    optimizer = [case.theoretical_memory_mb["optimizer_mb"] for case in selected]
-
-    plt.figure(figsize=(8, 5))
-    plt.bar(stages, params, label="params", color="#315A9A")
-    plt.bar(stages, grads, bottom=params, label="grads", color="#4E8A3A")
-    bottoms = [p + g for p, g in zip(params, grads)]
-    plt.bar(stages, optimizer, bottom=bottoms, label="optimizer", color="#C56B1A")
-    plt.xticks(stages, [f"stage {stage}" for stage in stages])
-    plt.ylabel("State memory (MB)")
-    plt.title("Theoretical ZeRO State Memory by Stage")
-    plt.grid(True, axis="y", alpha=0.3)
-    plt.legend()
     output.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(output)
@@ -374,9 +393,11 @@ def main() -> None:
     elif args.plot == "stage-comm":
         plot_stage_metric(cases=cases, metric="stage-comm", output=out)
     elif args.plot == "memory":
+        plot_measured_state_memory(cases=cases, output=out)
+    elif args.plot == "peak-memory":
         plot_peak_memory(cases=cases, output=out)
     else:
-        plot_theoretical_memory(cases=cases, output=out)
+        raise ValueError(f"Unsupported plot type: {args.plot}")
 
     print(f"[visualize] wrote {out}")
 

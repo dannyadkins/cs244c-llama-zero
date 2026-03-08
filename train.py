@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
 
     parser.add_argument("--data-mode", type=str, default="fineweb", choices=["fineweb", "synthetic"])
-    parser.add_argument("--tokenizer-name", type=str, default="NousResearch/Meta-Llama-3.1-8B")
+    parser.add_argument("--tokenizer-name", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--fineweb-subset", type=str, default="sample-10BT")
     parser.add_argument("--fineweb-split", type=str, default="train")
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)

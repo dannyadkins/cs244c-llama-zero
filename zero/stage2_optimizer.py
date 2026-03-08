@@ -14,10 +14,13 @@ from .common import (
     ShardSpec,
     assign_flat_params,
     build_flat_param_metadata,
+    bytes_to_mb,
     compute_shard_spec,
     flatten_grads_fp32,
     flatten_params_fp32,
     get_rank_world_size,
+    params_num_bytes,
+    tensors_num_bytes,
 )
 
 
@@ -46,6 +49,7 @@ class ZeROStage2Optimizer:
         self.step_count = 0
         self.exp_avg = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
         self.exp_avg_sq = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
+        self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
 
     def backward(self, loss: torch.Tensor) -> None:
         loss.backward()
@@ -54,6 +58,11 @@ class ZeROStage2Optimizer:
         return {"prepare_comm_ms": 0.0}
 
     def zero_grad(self) -> None:
+        self.grad_shard.zero_()
+        for p in self.meta.params:
+            p.grad = None
+
+    def _release_full_param_grads(self) -> None:
         for p in self.meta.params:
             p.grad = None
 
@@ -101,12 +110,13 @@ class ZeROStage2Optimizer:
         expected = self.shard.shard_numel
         if reduced_shard.numel() < expected:
             raise ValueError(f"reduce_scatter returned too few elements: {reduced_shard.numel()} < {expected}")
-        local_grads = reduced_shard[:expected].clone()
-        grad_norm = self._clip_local_grads_inplace(local_grads, max_grad_norm=max_grad_norm)
+        self.grad_shard.copy_(reduced_shard[:expected])
+        self._release_full_param_grads()
+        grad_norm = self._clip_local_grads_inplace(self.grad_shard, max_grad_norm=max_grad_norm)
 
         local_params = flat_params[self.shard.shard_start : self.shard.shard_end].clone()
         t_opt0 = time.perf_counter()
-        updated_local = self._adamw_update(local_params=local_params, local_grads=local_grads)
+        updated_local = self._adamw_update(local_params=local_params, local_grads=self.grad_shard)
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
 
         t_comm1 = time.perf_counter()
@@ -125,6 +135,17 @@ class ZeROStage2Optimizer:
     def step(self, max_grad_norm: float = 0.0) -> float:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
 
+    def memory_state_breakdown_mb(self) -> Dict[str, float]:
+        params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
+        grads_mb = bytes_to_mb(tensors_num_bytes([self.grad_shard]))
+        optimizer_mb = bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq]))
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
+
     def state_dict(self) -> Dict[str, object]:
         return {
             "step_count": self.step_count,
@@ -134,6 +155,7 @@ class ZeROStage2Optimizer:
             "shard_end": self.shard.shard_end,
             "exp_avg": self.exp_avg.detach().cpu(),
             "exp_avg_sq": self.exp_avg_sq.detach().cpu(),
+            "grad_shard": self.grad_shard.detach().cpu(),
             "hparams": {
                 "lr": self.lr,
                 "betas": self.betas,
@@ -146,3 +168,8 @@ class ZeROStage2Optimizer:
         self.step_count = int(state["step_count"])
         self.exp_avg = state["exp_avg"].to(device=self.meta.device, dtype=torch.float32)
         self.exp_avg_sq = state["exp_avg_sq"].to(device=self.meta.device, dtype=torch.float32)
+        grad_shard = state.get("grad_shard")
+        if grad_shard is None:
+            self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
+        else:
+            self.grad_shard = grad_shard.to(device=self.meta.device, dtype=torch.float32)

@@ -324,3 +324,46 @@ def _stage3_checkpoint_restore_worker(rank: int, world_size: int, port: int) -> 
 def test_stage3_checkpoint_restore_world2() -> None:
     port = _find_free_port()
     mp.spawn(_stage3_checkpoint_restore_worker, args=(2, port), nprocs=2, join=True)
+
+
+def _stage2_sharded_grad_worker(rank: int, world_size: int, port: int) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        cfg = _test_config()
+        torch.manual_seed(1234)
+
+        model = LlamaForCausalLM(cfg)
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+
+        engine = ZeROStage2Optimizer(model=model, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+        local_ids = _local_batch(step=0, rank=rank, batch_size=3, seq_len=cfg.max_seq_len, vocab_size=cfg.vocab_size)
+
+        engine.zero_grad()
+        engine.prepare_forward()
+        loss = model(input_ids=local_ids, labels=local_ids).loss
+        assert loss is not None
+        engine.backward(loss)
+        engine.step()
+
+        assert all(param.grad is None for param in model.parameters())
+        assert engine.grad_shard.numel() == engine.shard.shard_numel
+
+        measured = engine.memory_state_breakdown_mb()
+        full_grad_mb = sum(param.numel() * 4 for param in model.parameters()) / (1024.0 * 1024.0)
+        assert measured["grads_mb"] < full_grad_mb
+        assert measured["grads_mb"] > 0.0
+    finally:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def test_stage2_releases_full_grads_and_keeps_shard_world2() -> None:
+    port = _find_free_port()
+    mp.spawn(_stage2_sharded_grad_worker, args=(2, port), nprocs=2, join=True)

@@ -21,14 +21,14 @@ def test_parse_summary_week3_schema(tmp_path: Path) -> None:
                 "peak_cuda_reserved_mb": 222.0,
                 "peak_cuda_max_allocated_mb": 333.0,
                 "peak_cuda_max_reserved_mb": 444.0,
+                "measured_state_memory_mb": {
+                    "params_mb": 90.0,
+                    "grads_mb": 45.0,
+                    "optimizer_mb": 70.0,
+                    "total_mb": 205.0,
+                },
                 "final_loss": 4.2,
                 "return_code": 0,
-                "theoretical_memory_mb": {
-                    "params_mb": 100.0,
-                    "grads_mb": 50.0,
-                    "optimizer_mb": 75.0,
-                    "total_mb": 225.0,
-                },
             }
         ]
     }
@@ -44,11 +44,11 @@ def test_parse_summary_week3_schema(tmp_path: Path) -> None:
     assert case.mean_tokens_per_s == 123.0
     assert case.peak_host_rss_mb == 321.0
     assert case.peak_cuda_max_reserved_mb == 444.0
-    assert case.theoretical_memory_mb == {
-        "params_mb": 100.0,
-        "grads_mb": 50.0,
-        "optimizer_mb": 75.0,
-        "total_mb": 225.0,
+    assert case.measured_state_memory_mb == {
+        "params_mb": 90.0,
+        "grads_mb": 45.0,
+        "optimizer_mb": 70.0,
+        "total_mb": 205.0,
     }
     assert case.return_code == 0
 
@@ -99,6 +99,7 @@ def test_case_peak_memory_prefers_host_when_cuda_is_zero() -> None:
         peak_cuda_max_reserved_mb=0.0,
         final_loss=None,
         return_code=0,
+        measured_state_memory_mb=None,
         theoretical_memory_mb=None,
     )
 
@@ -120,6 +121,7 @@ def test_representative_cases_prefer_unlimited_baseline() -> None:
         peak_cuda_max_reserved_mb=None,
         final_loss=None,
         return_code=0,
+        measured_state_memory_mb={"params_mb": 1.0, "grads_mb": 1.0, "optimizer_mb": 1.0, "total_mb": 3.0},
         theoretical_memory_mb={"params_mb": 1.0, "grads_mb": 1.0, "optimizer_mb": 1.0, "total_mb": 3.0},
     )
     cases = [

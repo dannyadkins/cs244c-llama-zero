@@ -22,7 +22,7 @@ def load_llama_tokenizer(tokenizer_name: str) -> TokenizerBundle:
             "transformers is required for real-data training. Install with `pip install transformers`."
         ) from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True, token=True)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     if tokenizer.eos_token_id is None:
         raise ValueError(f"Tokenizer '{tokenizer_name}' has no eos_token_id")
@@ -31,7 +31,7 @@ def load_llama_tokenizer(tokenizer_name: str) -> TokenizerBundle:
 
     return TokenizerBundle(
         tokenizer=tokenizer,
-        vocab_size=len(tokenizer),
+        vocab_size=tokenizer.vocab_size,
         eos_token_id=tokenizer.eos_token_id,
     )
 

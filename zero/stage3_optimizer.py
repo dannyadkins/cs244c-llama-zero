@@ -16,9 +16,11 @@ from .common import (
     ShardSpec,
     assign_flat_params,
     build_flat_param_metadata_from_params,
+    bytes_to_mb,
     compute_shard_spec,
     flatten_params_fp32,
     get_rank_world_size,
+    tensors_num_bytes,
     unique_trainable_params,
 )
 
@@ -402,6 +404,23 @@ class ZeROStage3Optimizer:
 
     def step(self, max_grad_norm: float = 0.0) -> float:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
+
+    def memory_state_breakdown_mb(self) -> Dict[str, float]:
+        local_param_tensors = [handle.local_param_shard for handle in self._handle_order]
+        grad_tensors = [handle.grad_shard for handle in self._handle_order]
+        optimizer_tensors = []
+        for handle in self._handle_order:
+            optimizer_tensors.extend([handle.exp_avg, handle.exp_avg_sq])
+
+        params_mb = bytes_to_mb(tensors_num_bytes(local_param_tensors))
+        grads_mb = bytes_to_mb(tensors_num_bytes(grad_tensors))
+        optimizer_mb = bytes_to_mb(tensors_num_bytes(optimizer_tensors))
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
 
     def state_dict(self) -> Dict[str, object]:
         return {

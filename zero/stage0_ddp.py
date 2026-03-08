@@ -8,7 +8,16 @@ import torch
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
-from .common import assign_flat_grads, build_flat_param_metadata, flatten_grads_fp32, get_rank_world_size
+from .common import (
+    assign_flat_grads,
+    build_flat_param_metadata,
+    bytes_to_mb,
+    flatten_grads_fp32,
+    get_rank_world_size,
+    grads_num_bytes,
+    params_num_bytes,
+    tensor_num_bytes,
+)
 
 
 @dataclass
@@ -81,6 +90,23 @@ class ZeROStage0DDP:
 
     def step(self, max_grad_norm: float = 0.0) -> float:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
+
+    def memory_state_breakdown_mb(self) -> Dict[str, float]:
+        optimizer_bytes = 0
+        for state in self.optimizer.state.values():
+            for value in state.values():
+                if torch.is_tensor(value):
+                    optimizer_bytes += tensor_num_bytes(value)
+
+        params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
+        grads_mb = bytes_to_mb(grads_num_bytes(self.meta.params))
+        optimizer_mb = bytes_to_mb(optimizer_bytes)
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
 
     def state_dict(self) -> Dict[str, object]:
         return {

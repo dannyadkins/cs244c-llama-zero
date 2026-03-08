@@ -69,6 +69,7 @@ class CaseResult:
     peak_cuda_reserved_mb: float | None
     peak_cuda_max_allocated_mb: float | None
     peak_cuda_max_reserved_mb: float | None
+    measured_state_memory_mb: Dict[str, float] | None
     theoretical_param_count: int
     theoretical_memory_mb: Dict[str, float]
     notes: str = ""
@@ -272,7 +273,7 @@ def _parse_step_metrics(log_text: str) -> Dict[str, object]:
     }
 
 
-def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
+def _parse_profile_memory(profile_path: Path) -> Dict[str, object]:
     if not profile_path.exists():
         return {
             "peak_host_rss_mb": None,
@@ -280,10 +281,15 @@ def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
             "peak_cuda_reserved_mb": None,
             "peak_cuda_max_allocated_mb": None,
             "peak_cuda_max_reserved_mb": None,
+            "measured_state_memory_mb": None,
         }
 
     payload = json.loads(profile_path.read_text())
     snapshots = payload.get("memory", [])
+    state_memory = payload.get("state_memory_breakdown_mb")
+    measured_state_memory_mb = None
+    if isinstance(state_memory, dict):
+        measured_state_memory_mb = {str(key): float(value) for key, value in state_memory.items()}
     if not snapshots:
         return {
             "peak_host_rss_mb": None,
@@ -291,6 +297,7 @@ def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
             "peak_cuda_reserved_mb": None,
             "peak_cuda_max_allocated_mb": None,
             "peak_cuda_max_reserved_mb": None,
+            "measured_state_memory_mb": measured_state_memory_mb,
         }
 
     def peak(key: str) -> float | None:
@@ -303,6 +310,7 @@ def _parse_profile_memory(profile_path: Path) -> Dict[str, float | None]:
         "peak_cuda_reserved_mb": peak("cuda_reserved_mb"),
         "peak_cuda_max_allocated_mb": peak("cuda_max_allocated_mb"),
         "peak_cuda_max_reserved_mb": peak("cuda_max_reserved_mb"),
+        "measured_state_memory_mb": measured_state_memory_mb,
     }
 
 
@@ -464,6 +472,7 @@ def _run_case(
             peak_cuda_reserved_mb=None,
             peak_cuda_max_allocated_mb=None,
             peak_cuda_max_reserved_mb=None,
+            measured_state_memory_mb=None,
             theoretical_param_count=num_params,
             theoretical_memory_mb=memory_mb,
             notes="dry_run",
@@ -523,6 +532,7 @@ def _run_case(
         peak_cuda_reserved_mb=memory_metrics["peak_cuda_reserved_mb"],
         peak_cuda_max_allocated_mb=memory_metrics["peak_cuda_max_allocated_mb"],
         peak_cuda_max_reserved_mb=memory_metrics["peak_cuda_max_reserved_mb"],
+        measured_state_memory_mb=memory_metrics["measured_state_memory_mb"],
         theoretical_param_count=num_params,
         theoretical_memory_mb=memory_mb,
         notes=notes,

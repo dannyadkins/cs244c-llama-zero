@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,6 +26,28 @@ class ShardSpec:
     shard_end: int
     shard_numel: int
     chunk_size: int
+
+
+def tensor_num_bytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+def bytes_to_mb(num_bytes: int) -> float:
+    return float(num_bytes) / (1024.0 * 1024.0)
+
+
+def params_num_bytes(params: Iterable[nn.Parameter]) -> int:
+    return sum(tensor_num_bytes(param.data) for param in unique_trainable_params(list(params)))
+
+
+def grads_num_bytes(params: Iterable[nn.Parameter]) -> int:
+    return sum(tensor_num_bytes(param.grad) for param in unique_trainable_params(list(params)))
+
+
+def tensors_num_bytes(tensors: Iterable[torch.Tensor | None]) -> int:
+    return sum(tensor_num_bytes(tensor) for tensor in tensors)
 
 
 def get_rank_world_size() -> Tuple[int, int]:

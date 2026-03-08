@@ -13,10 +13,14 @@ from .common import (
     ShardSpec,
     assign_flat_params,
     build_flat_param_metadata,
+    bytes_to_mb,
     compute_shard_spec,
     flatten_grads_fp32,
     flatten_params_fp32,
     get_rank_world_size,
+    grads_num_bytes,
+    params_num_bytes,
+    tensors_num_bytes,
 )
 
 
@@ -113,6 +117,17 @@ class ZeROStage1Optimizer:
 
     def step(self, max_grad_norm: float = 0.0) -> float:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
+
+    def memory_state_breakdown_mb(self) -> Dict[str, float]:
+        params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
+        grads_mb = bytes_to_mb(grads_num_bytes(self.meta.params))
+        optimizer_mb = bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq]))
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
 
     def state_dict(self) -> Dict[str, object]:
         return {

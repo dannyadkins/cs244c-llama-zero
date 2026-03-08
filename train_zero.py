@@ -377,6 +377,9 @@ def train(args: argparse.Namespace) -> None:
     if rank_profile_enabled:
         summaries = timers.summarize()
         timer_payload = {name: asdict(summary) for name, summary in summaries.items()}
+        state_memory_breakdown_mb = None
+        if hasattr(engine, "memory_state_breakdown_mb"):
+            state_memory_breakdown_mb = engine.memory_state_breakdown_mb()
         profile_payload = {
             "rank": rank,
             "world_size": world_size,
@@ -386,6 +389,7 @@ def train(args: argparse.Namespace) -> None:
             "timers": timer_payload,
             "memory": memory.as_dicts() if should_record_memory else [],
             "steps": step_profiles,
+            "state_memory_breakdown_mb": state_memory_breakdown_mb,
         }
 
         profile_path = Path(args.profile_json)
