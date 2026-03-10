@@ -111,8 +111,15 @@ def compute_shard_spec(total_numel: int, rank: int, world_size: int) -> ShardSpe
     )
 
 
+def _flatten_tensor_fp32(tensor: torch.Tensor) -> torch.Tensor:
+    flat = tensor.detach().view(-1)
+    if flat.dtype == torch.float32:
+        return flat
+    return flat.to(torch.float32)
+
+
 def flatten_params_fp32(meta: FlatParamMetadata) -> torch.Tensor:
-    return torch.cat([p.data.detach().view(-1).to(torch.float32) for p in meta.params], dim=0)
+    return torch.cat([_flatten_tensor_fp32(p.data) for p in meta.params], dim=0)
 
 
 def flatten_grads_fp32(meta: FlatParamMetadata) -> torch.Tensor:
@@ -121,7 +128,7 @@ def flatten_grads_fp32(meta: FlatParamMetadata) -> torch.Tensor:
         if p.grad is None:
             parts.append(torch.zeros(p.numel(), dtype=torch.float32, device=p.device))
         else:
-            parts.append(p.grad.detach().view(-1).to(torch.float32))
+            parts.append(_flatten_tensor_fp32(p.grad))
     return torch.cat(parts, dim=0)
 
 
@@ -132,7 +139,13 @@ def assign_flat_params(meta: FlatParamMetadata, flat_params: torch.Tensor) -> No
     for p, start, shape in zip(meta.params, meta.offsets, meta.shapes):
         numel = math.prod(shape)
         chunk = flat_params[start : start + numel].view(shape)
-        p.data = chunk.to(dtype=p.dtype, device=p.device).clone()
+        if chunk.dtype != p.dtype or chunk.device != p.device:
+            chunk = chunk.to(dtype=p.dtype, device=p.device)
+
+        if p.data.shape == shape and p.data.dtype == chunk.dtype and p.data.device == chunk.device:
+            p.data.copy_(chunk)
+        else:
+            p.data = chunk.clone()
 
 
 def assign_flat_grads(meta: FlatParamMetadata, flat_grads: torch.Tensor) -> None:

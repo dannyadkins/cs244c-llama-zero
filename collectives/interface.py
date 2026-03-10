@@ -77,6 +77,10 @@ class SendRecvCollectives(CollectiveOps):
 class TorchCollectives(CollectiveOps):
     """Reference implementation using built-in distributed collectives."""
 
+    @staticmethod
+    def _supports_fast_collectives(tensor: torch.Tensor) -> bool:
+        return tensor.device.type == "cuda" and hasattr(dist, "all_gather_into_tensor") and hasattr(dist, "reduce_scatter_tensor")
+
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
         out = tensor.clone()
         dist.all_reduce(out)
@@ -95,6 +99,29 @@ class TorchCollectives(CollectiveOps):
 
         if flat.numel() == 0:
             return flat.clone()
+
+        chunk = (flat.numel() + world_size - 1) // world_size
+        padded_numel = chunk * world_size
+
+        if self._supports_fast_collectives(flat):
+            if padded_numel != flat.numel():
+                padded = torch.zeros(padded_numel, dtype=flat.dtype, device=flat.device)
+                padded[: flat.numel()] = flat
+            else:
+                padded = flat
+
+            out = torch.empty(chunk, dtype=flat.dtype, device=flat.device)
+            try:
+                dist.reduce_scatter_tensor(out, padded)
+                _maybe_simulate_collective_delay(
+                    num_bytes=out.numel() * out.element_size(),
+                    world_size=world_size,
+                )
+                start = rank * chunk
+                end = min(start + chunk, flat.numel())
+                return out[: max(0, end - start)].contiguous()
+            except RuntimeError:
+                pass
 
         divisible = flat.numel() % world_size == 0
         if divisible:
@@ -123,7 +150,6 @@ class TorchCollectives(CollectiveOps):
             world_size=world_size,
         )
 
-        chunk = (flat.numel() + world_size - 1) // world_size
         start = rank * chunk
         end = min(start + chunk, flat.numel())
         return reduced[start:end].contiguous()
@@ -133,9 +159,14 @@ class TorchCollectives(CollectiveOps):
         world_size = dist.get_world_size()
 
         size_tensor = torch.tensor([local_flat.numel()], device=local_flat.device, dtype=torch.long)
-        size_list = [torch.zeros_like(size_tensor) for _ in range(world_size)]
-        dist.all_gather(size_list, size_tensor)
-        sizes = [int(x.item()) for x in size_list]
+        if self._supports_fast_collectives(local_flat):
+            sizes_tensor = torch.empty(world_size, dtype=torch.long, device=local_flat.device)
+            dist.all_gather_into_tensor(sizes_tensor, size_tensor)
+            sizes = [int(x.item()) for x in sizes_tensor]
+        else:
+            size_list = [torch.zeros_like(size_tensor) for _ in range(world_size)]
+            dist.all_gather(size_list, size_tensor)
+            sizes = [int(x.item()) for x in size_list]
 
         max_size = max(sizes)
         if max_size == 0:
@@ -147,8 +178,13 @@ class TorchCollectives(CollectiveOps):
         else:
             padded = local_flat
 
-        gathered = [torch.empty_like(padded) for _ in range(world_size)]
-        dist.all_gather(gathered, padded)
+        if self._supports_fast_collectives(local_flat):
+            gathered_tensor = torch.empty(world_size * max_size, dtype=padded.dtype, device=padded.device)
+            dist.all_gather_into_tensor(gathered_tensor, padded)
+            gathered = [gathered_tensor[i * max_size : (i + 1) * max_size] for i in range(world_size)]
+        else:
+            gathered = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered, padded)
         _maybe_simulate_collective_delay(
             num_bytes=padded.numel() * padded.element_size(),
             world_size=world_size,

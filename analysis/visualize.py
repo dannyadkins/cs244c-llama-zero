@@ -18,6 +18,7 @@ class CaseView:
     bandwidth_gbps: float
     log_path: Path
     mean_tokens_per_s: float | None
+    mean_tflops_per_s: float | None
     mean_comm_ms: float | None
     mean_fb_ms: float | None
     mean_opt_ms: float | None
@@ -39,8 +40,8 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         type=str,
         default="throughput",
-        choices=["loss", "throughput", "comm", "stage-throughput", "grouped-stage-throughput", "stage-comm", "memory", "peak-memory"],
-        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, grouped model-vs-stage throughput, measured state memory, or measured peak memory",
+        choices=["loss", "throughput", "tflops", "comm", "stage-throughput", "grouped-stage-throughput", "stage-comm", "memory", "peak-memory"],
+        help="Plot type: per-step loss, bandwidth sweep throughput/TFLOPs/comm, stage comparison throughput/comm, grouped model-vs-stage throughput, measured state memory, or measured peak memory",
     )
     parser.add_argument("--output", type=str, default="analysis/figures/week3_plot.png")
     parser.add_argument("--model-size", type=str, default="", help="Optional filter for one model size")
@@ -95,6 +96,7 @@ def parse_summary(summary_path: Path) -> List[CaseView]:
                 bandwidth_gbps=_result_bandwidth(result),
                 log_path=raw_log_path,
                 mean_tokens_per_s=_as_optional_float(result.get("mean_tokens_per_s")),
+                mean_tflops_per_s=_as_optional_float(result.get("mean_tflops_per_s")),
                 mean_comm_ms=_as_optional_float(result.get("mean_comm_ms")),
                 mean_fb_ms=_as_optional_float(result.get("mean_fb_ms")),
                 mean_opt_ms=_as_optional_float(result.get("mean_opt_ms")),
@@ -213,9 +215,18 @@ def plot_bandwidth_metric(cases: List[CaseView], metric: str, output: Path) -> N
     except ImportError as exc:
         raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
 
-    key = "mean_tokens_per_s" if metric == "throughput" else "mean_comm_ms"
-    ylabel = "Tokens / s" if metric == "throughput" else "Mean communication ms / step"
-    title = "Throughput vs Bandwidth" if metric == "throughput" else "Communication Cost vs Bandwidth"
+    if metric == "throughput":
+        key = "mean_tokens_per_s"
+        ylabel = "Tokens / s"
+        title = "Throughput vs Bandwidth"
+    elif metric == "tflops":
+        key = "mean_tflops_per_s"
+        ylabel = "Approx. training TFLOPs / s"
+        title = "Approx. Training TFLOPs vs Bandwidth"
+    else:
+        key = "mean_comm_ms"
+        ylabel = "Mean communication ms / step"
+        title = "Communication Cost vs Bandwidth"
 
     by_stage: Dict[int, List[CaseView]] = {}
     for case in cases:
@@ -425,6 +436,8 @@ def main() -> None:
         plot_loss(cases=cases, output=out)
     elif args.plot == "throughput":
         plot_bandwidth_metric(cases=cases, metric="throughput", output=out)
+    elif args.plot == "tflops":
+        plot_bandwidth_metric(cases=cases, metric="tflops", output=out)
     elif args.plot == "comm":
         plot_bandwidth_metric(cases=cases, metric="comm", output=out)
     elif args.plot == "stage-throughput":

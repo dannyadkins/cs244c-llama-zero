@@ -57,8 +57,8 @@ def test_build_cases_cartesian_product() -> None:
 def test_parse_step_metrics_extracts_means() -> None:
     log_text = "\n".join(
         [
-            "[step 00001] loss=8.1000 avg100=8.1000 tokens/s=1,200 grad_norm=0.900 fb_ms=10.0 comm_ms=5.0 opt_ms=2.0",
-            "[step 00002] loss=8.0000 avg100=8.0500 tokens/s=800 grad_norm=1.100 fb_ms=20.0 comm_ms=15.0 opt_ms=4.0",
+            "[step 00001] loss=8.1000 avg100=8.1000 tokens/s=1,200 grad_norm=0.900 fb_ms=10.0 comm_ms=5.0 opt_ms=2.0 tflops=0.500",
+            "[step 00002] loss=8.0000 avg100=8.0500 tokens/s=800 grad_norm=1.100 fb_ms=20.0 comm_ms=15.0 opt_ms=4.0 tflops=0.250",
         ]
     )
     metrics = harness._parse_step_metrics(log_text)
@@ -66,6 +66,7 @@ def test_parse_step_metrics_extracts_means() -> None:
     assert metrics["final_loss"] == 8.0
     assert metrics["logged_steps"] == 2
     assert metrics["mean_tokens_per_s"] == 1000.0
+    assert metrics["mean_tflops_per_s"] == 0.375
     assert metrics["mean_fb_ms"] == 15.0
     assert metrics["mean_comm_ms"] == 10.0
     assert metrics["mean_opt_ms"] == 3.0
@@ -106,6 +107,7 @@ def test_parse_profile_memory_extracts_peaks(tmp_path: Path) -> None:
         "peak_cuda_reserved_mb": 20.0,
         "peak_cuda_max_allocated_mb": 35.0,
         "peak_cuda_max_reserved_mb": 45.0,
+        "measured_state_memory_mb": None,
     }
 
 
@@ -258,7 +260,7 @@ def test_run_case_records_profile_memory_metrics(tmp_path: Path, monkeypatch) ->
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
-            stdout="[step 00001] loss=8.1000 avg100=8.1000 tokens/s=1,200 grad_norm=0.900 fb_ms=10.0 comm_ms=5.0 opt_ms=2.0\n",
+            stdout="[step 00001] loss=8.1000 avg100=8.1000 tokens/s=1,200 grad_norm=0.900 fb_ms=10.0 comm_ms=5.0 opt_ms=2.0 tflops=0.750\n",
             stderr="",
         )
 
@@ -275,6 +277,7 @@ def test_run_case_records_profile_memory_metrics(tmp_path: Path, monkeypatch) ->
 
     assert result.return_code == 0
     assert result.peak_host_rss_mb == 250.0
+    assert result.mean_tflops_per_s == 0.75
     assert result.peak_cuda_allocated_mb == 1.5
     assert result.peak_cuda_reserved_mb == 2.5
     assert result.peak_cuda_max_allocated_mb == 3.5

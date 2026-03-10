@@ -22,7 +22,7 @@ from model import build_config, estimate_num_parameters
 
 
 STEP_RE = re.compile(
-    r"\[step\s+(\d+)\]\s+loss=([0-9.eE+\-]+).*?tokens/s=([0-9,]+).*?grad_norm=([0-9.eE+\-a-zA-Z]+).*?fb_ms=([0-9.eE+\-]+).*?comm_ms=([0-9.eE+\-]+).*?opt_ms=([0-9.eE+\-]+)"
+    r"\[step\s+(\d+)\]\s+loss=([0-9.eE+\-]+).*?tokens/s=([0-9,]+).*?grad_norm=([0-9.eE+\-a-zA-Z]+).*?fb_ms=([0-9.eE+\-]+).*?comm_ms=([0-9.eE+\-]+).*?opt_ms=([0-9.eE+\-]+)(?:.*?tflops=([0-9.eE+\-]+))?"
 )
 
 
@@ -61,6 +61,7 @@ class CaseResult:
     final_loss: float | None
     logged_steps: int
     mean_tokens_per_s: float | None
+    mean_tflops_per_s: float | None
     mean_comm_ms: float | None
     mean_fb_ms: float | None
     mean_opt_ms: float | None
@@ -246,6 +247,7 @@ def _theoretical_memory(case: CaseConfig) -> tuple[int, Dict[str, float]]:
 def _parse_step_metrics(log_text: str) -> Dict[str, object]:
     losses: List[float] = []
     tps: List[float] = []
+    tflops: List[float] = []
     comm_ms: List[float] = []
     fb_ms: List[float] = []
     opt_ms: List[float] = []
@@ -256,6 +258,8 @@ def _parse_step_metrics(log_text: str) -> Dict[str, object]:
             continue
         losses.append(float(m.group(2)))
         tps.append(float(m.group(3).replace(",", "")))
+        if m.group(8) is not None:
+            tflops.append(float(m.group(8)))
         fb_ms.append(float(m.group(5)))
         comm_ms.append(float(m.group(6)))
         opt_ms.append(float(m.group(7)))
@@ -267,6 +271,7 @@ def _parse_step_metrics(log_text: str) -> Dict[str, object]:
         "final_loss": losses[-1] if losses else None,
         "logged_steps": len(losses),
         "mean_tokens_per_s": mean_or_none(tps),
+        "mean_tflops_per_s": mean_or_none(tflops),
         "mean_comm_ms": mean_or_none(comm_ms),
         "mean_fb_ms": mean_or_none(fb_ms),
         "mean_opt_ms": mean_or_none(opt_ms),
@@ -464,6 +469,7 @@ def _run_case(
             final_loss=None,
             logged_steps=0,
             mean_tokens_per_s=None,
+            mean_tflops_per_s=None,
             mean_comm_ms=None,
             mean_fb_ms=None,
             mean_opt_ms=None,
@@ -524,6 +530,7 @@ def _run_case(
         final_loss=metrics["final_loss"],
         logged_steps=int(metrics["logged_steps"]),
         mean_tokens_per_s=metrics["mean_tokens_per_s"],
+        mean_tflops_per_s=metrics["mean_tflops_per_s"],
         mean_comm_ms=metrics["mean_comm_ms"],
         mean_fb_ms=metrics["mean_fb_ms"],
         mean_opt_ms=metrics["mean_opt_ms"],
@@ -549,6 +556,10 @@ def _build_summary(results: List[CaseResult], args: argparse.Namespace) -> Dict[
         "theoretical_memory_note": (
             "Memory estimates are idealized ZeRO state-memory terms (params, grads, optimizer states), "
             "fp32-based, and do not include activations, temporary buffers, or framework overhead."
+        ),
+        "profiled_tflops_note": (
+            "Training TFLOPs/s is derived from the train_zero TFLOPs mode: estimated cluster step FLOPs by default, "
+            "or torch.profiler-derived FLOPs when profile mode is explicitly enabled."
         ),
         "num_cases": len(results),
         "num_failures": sum(1 for r in results if r.return_code != 0),

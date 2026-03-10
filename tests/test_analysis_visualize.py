@@ -13,6 +13,7 @@ def test_parse_summary_week3_schema(tmp_path: Path) -> None:
                 "config": {"stage": 3, "model_size": "tiny", "bandwidth_gbps": 5.0},
                 "log_path": "experiments/results/run/logs/case.log",
                 "mean_tokens_per_s": 123.0,
+                "mean_tflops_per_s": 0.456,
                 "mean_comm_ms": 45.0,
                 "mean_fb_ms": 67.0,
                 "mean_opt_ms": 8.0,
@@ -42,6 +43,7 @@ def test_parse_summary_week3_schema(tmp_path: Path) -> None:
     assert case.model_size == "tiny"
     assert case.bandwidth_gbps == 5.0
     assert case.mean_tokens_per_s == 123.0
+    assert case.mean_tflops_per_s == 0.456
     assert case.peak_host_rss_mb == 321.0
     assert case.peak_cuda_max_reserved_mb == 444.0
     assert case.measured_state_memory_mb == {
@@ -89,6 +91,7 @@ def test_case_peak_memory_prefers_host_when_cuda_is_zero() -> None:
         bandwidth_gbps=0.0,
         log_path=Path("/tmp/missing.log"),
         mean_tokens_per_s=None,
+        mean_tflops_per_s=None,
         mean_comm_ms=None,
         mean_fb_ms=None,
         mean_opt_ms=None,
@@ -111,6 +114,7 @@ def test_representative_cases_prefer_unlimited_baseline() -> None:
         model_size="tiny",
         log_path=Path("/tmp/missing.log"),
         mean_tokens_per_s=None,
+        mean_tflops_per_s=None,
         mean_comm_ms=None,
         mean_fb_ms=None,
         mean_opt_ms=None,

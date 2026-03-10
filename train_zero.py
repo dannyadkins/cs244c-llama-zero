@@ -13,8 +13,14 @@ import torch
 import torch.distributed as dist
 
 from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
-from model import LlamaForCausalLM, build_config, estimate_num_parameters, human_readable_count
-from profiler import MemoryTracker, TimerRegistry, overlap_efficiency
+from model import (
+    LlamaForCausalLM,
+    build_config,
+    estimate_num_parameters,
+    human_readable_count,
+)
+from profiler import FlopTracker, MemoryTracker, TimerRegistry, flops_to_tflops_per_second, overlap_efficiency
+from profiler import estimate_transformer_train_flops
 from train import batch_from_chunk, make_data_loader, set_seed
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
@@ -76,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=str, default="")
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument("--profile-rank0-only", action="store_true")
+    parser.add_argument("--tflops-mode", type=str, default="estimate", choices=["estimate", "profile", "off"])
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--verbose-memory", action="store_true")
 
@@ -110,6 +117,17 @@ def autocast_context(device: torch.device, dtype_name: str):
     if dtype_name == "float32":
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def configure_runtime(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
 
 def broadcast_model(model: LlamaForCausalLM) -> None:
@@ -182,7 +200,8 @@ def save_checkpoint(
 
 def train(args: argparse.Namespace) -> None:
     rank, world_size, device = init_distributed()
-    verbose_enabled = args.verbose or args.max_steps <= 10
+    verbose_enabled = bool(args.verbose)
+    configure_runtime(device)
     set_seed(args.seed)
     log_event(rank, f"initialized distributed world_size={world_size} device={device} pid={os.getpid()}", force=verbose_enabled)
 
@@ -233,8 +252,9 @@ def train(args: argparse.Namespace) -> None:
     engine = build_engine(args=args, model=model, collectives=collectives)
     log_event(rank, f"engine ready stage={args.zero_stage} impl={args.collective_impl}", force=verbose_enabled)
 
+    n_params = estimate_num_parameters(cfg)
+
     if rank == 0:
-        n_params = estimate_num_parameters(cfg)
         print(
             f"[init] stage={args.zero_stage} impl={args.collective_impl} "
             f"world_size={world_size} model={cfg.name} params={human_readable_count(n_params)} ({n_params:,}) "
@@ -248,6 +268,7 @@ def train(args: argparse.Namespace) -> None:
     data_iter: Iterator[torch.Tensor] = iter(loader)
 
     timers = TimerRegistry(device=device)
+    flop_tracker = FlopTracker(device=device) if rank == 0 and args.tflops_mode == "profile" else None
     memory = MemoryTracker(device=device)
     enable_profile_output = bool(args.profile_json)
     should_record_memory = args.profile_memory_interval > 0
@@ -260,6 +281,16 @@ def train(args: argparse.Namespace) -> None:
 
     recent_losses = []
     t_train_start = time.perf_counter()
+    step_flops: float | None = None
+    if args.tflops_mode == "estimate":
+        step_flops = estimate_transformer_train_flops(
+            cfg=cfg,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            grad_accum_steps=args.grad_accum_steps,
+            world_size=world_size,
+            stage=args.zero_stage,
+        )
 
     for step in range(1, args.max_steps + 1):
         log_event(rank, f"starting step={step}/{args.max_steps}", force=verbose_enabled)
@@ -277,29 +308,39 @@ def train(args: argparse.Namespace) -> None:
         fwd_bwd_timer = timers.timer("forward_backward")
         fwd_bwd_timer.start()
 
-        micro_losses = []
-        for _micro in range(args.grad_accum_steps):
-            log_event(rank, f"step={step} microbatch begin", force=verbose_enabled)
-            try:
-                chunk = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                chunk = next(data_iter)
+        def run_microbatches() -> list[float]:
+            micro_losses_local = []
+            nonlocal data_iter
+            for _micro in range(args.grad_accum_steps):
+                log_event(rank, f"step={step} microbatch begin", force=verbose_enabled)
+                try:
+                    chunk = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    chunk = next(data_iter)
 
-            batch = batch_from_chunk(chunk)
-            input_ids = batch.input_ids.to(device, non_blocking=True)
-            labels = batch.labels.to(device, non_blocking=True)
+                batch = batch_from_chunk(chunk)
+                input_ids = batch.input_ids.to(device, non_blocking=True)
+                labels = batch.labels.to(device, non_blocking=True)
 
-            with autocast_context(device, args.dtype):
-                out = model(input_ids=input_ids, labels=labels)
-                loss = out.loss
-                if loss is None:
-                    raise RuntimeError("Model did not return loss even though labels were provided")
-                scaled_loss = loss / args.grad_accum_steps
+                with autocast_context(device, args.dtype):
+                    out = model(input_ids=input_ids, labels=labels)
+                    loss = out.loss
+                    if loss is None:
+                        raise RuntimeError("Model did not return loss even though labels were provided")
+                    scaled_loss = loss / args.grad_accum_steps
 
-            micro_losses.append(float(loss.detach().float().item()))
-            engine.backward(scaled_loss)
-            log_event(rank, f"step={step} microbatch end loss={micro_losses[-1]:.4f}", force=verbose_enabled)
+                micro_losses_local.append(float(loss.detach().float().item()))
+                engine.backward(scaled_loss)
+                log_event(rank, f"step={step} microbatch end loss={micro_losses_local[-1]:.4f}", force=verbose_enabled)
+            return micro_losses_local
+
+        if rank == 0 and flop_tracker is not None and step_flops is None:
+            micro_losses, profiled_flops = flop_tracker.measure(label=f"step_{step}", fn=run_microbatches)
+            if profiled_flops is not None:
+                step_flops = profiled_flops * world_size
+        else:
+            micro_losses = run_microbatches()
 
         fwd_bwd_ms = fwd_bwd_timer.stop()
         log_event(rank, f"step={step} forward_backward complete fb_ms={fwd_bwd_ms:.2f}", force=verbose_enabled)
@@ -327,6 +368,9 @@ def train(args: argparse.Namespace) -> None:
         iter_ms = iter_timer.stop()
         step_time = iter_ms / 1000.0
         tokens_per_second = global_tokens_per_step / max(step_time, 1e-8)
+        tflops_per_second = None
+        if step_flops is not None:
+            tflops_per_second = flops_to_tflops_per_second(total_flops=step_flops, step_time_s=step_time)
         compute_ms = max(iter_ms - comm_ms, 0.0)
         overlap_ratio = overlap_efficiency(step_ms=iter_ms, compute_ms=compute_ms, communication_ms=comm_ms)
 
@@ -336,6 +380,7 @@ def train(args: argparse.Namespace) -> None:
                 f"[step {step:05d}] loss={step_loss:.4f} avg100={avg_loss:.4f} "
                 f"tokens/s={tokens_per_second:,.0f} grad_norm={grad_norm_value:.3f} "
                 f"fb_ms={fwd_bwd_ms:.2f} comm_ms={comm_ms:.2f} opt_ms={step_stats['optim_ms']:.2f}"
+                + (f" tflops={tflops_per_second:.3f}" if tflops_per_second is not None else "")
                 ,
                 flush=True,
             )
@@ -346,6 +391,7 @@ def train(args: argparse.Namespace) -> None:
                     "step": step,
                     "loss": step_loss,
                     "tokens_per_second": tokens_per_second,
+                    "tflops_per_second": tflops_per_second,
                     "grad_norm": grad_norm_value,
                     "forward_backward_ms": fwd_bwd_ms,
                     "communication_ms": comm_ms,
@@ -410,6 +456,11 @@ def train(args: argparse.Namespace) -> None:
             "overlap_enabled": False,
             "timers": timer_payload,
             "memory": memory.as_dicts() if should_record_memory else [],
+            "flops": {
+                "measurements": flop_tracker.as_dicts() if flop_tracker is not None else [],
+                "profiled_step_flops": step_flops,
+                "tflops_mode": args.tflops_mode,
+            },
             "steps": step_profiles,
             "state_memory_breakdown_mb": state_memory_breakdown_mb,
             "overlap_summary": overlap_summary,

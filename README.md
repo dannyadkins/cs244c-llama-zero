@@ -2,7 +2,7 @@
 
 This repository now contains the Week 1 foundation, Week 2 ZeRO stages 0-2 integration, and Week 3 Stage 3 + experiment harness/analysis tooling.
 
-For the current handoff status and exact remaining execution plan, read `PROJECT_STATUS.md`.
+For the current experiment status, runbook, and remaining execution plan, read `experiments/README.md`.
 
 ## Implemented Scope
 
