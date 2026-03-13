@@ -279,9 +279,12 @@ def train(args: argparse.Namespace) -> None:
     measured_step_index = args.memory_warmup_steps + 1 if args.measure_memory_step else None
     measured_step_memory = None
     measured_step_state_timeline = []
+    measured_step_peak_observation = None
+    measured_step_peak_observed_max = -1.0
     live_state_breakdown = getattr(engine, "live_model_state_breakdown_mb", None)
     if live_state_breakdown is None:
         live_state_breakdown = getattr(engine, "memory_state_breakdown_mb", None)
+    debug_memory_components = getattr(engine, "debug_memory_components_mb", None)
 
     if args.measure_memory_step and args.max_steps < measured_step_index:
         raise ValueError(
@@ -302,6 +305,33 @@ def train(args: argparse.Namespace) -> None:
             f"recorded memory snapshot start {format_device_memory(device)}",
             force=verbose_enabled or args.verbose_memory,
         )
+
+    def record_memory_with_peak_observation(label: str, *, capture_peak: bool) -> None:
+        nonlocal measured_step_peak_observation
+        nonlocal measured_step_peak_observed_max
+
+        snapshot = memory.record(label)
+        if not capture_peak:
+            return
+
+        observed_peak_mb = float(snapshot.cuda_max_allocated_mb)
+        if observed_peak_mb <= measured_step_peak_observed_max + 1e-6:
+            return
+
+        measured_step_peak_observed_max = observed_peak_mb
+        observation = {
+            "label": label,
+            "timestamp_s": float(snapshot.timestamp_s),
+            "allocated_mb": float(snapshot.cuda_allocated_mb),
+            "reserved_mb": float(snapshot.cuda_reserved_mb),
+            "max_allocated_mb": float(snapshot.cuda_max_allocated_mb),
+            "max_reserved_mb": float(snapshot.cuda_max_reserved_mb),
+        }
+        if live_state_breakdown is not None:
+            observation["live_state_breakdown_mb"] = live_state_breakdown()
+        if callable(debug_memory_components):
+            observation["debug_memory_components_mb"] = debug_memory_components()
+        measured_step_peak_observation = observation
 
     recent_losses = []
     t_train_start = time.perf_counter()
@@ -330,7 +360,7 @@ def train(args: argparse.Namespace) -> None:
             if hasattr(engine, "memory_trace_active"):
                 engine.memory_trace_active = bool(should_record_memory and rank_profile_enabled)
             if should_record_memory and rank_profile_enabled:
-                memory.record(f"measured_step_{step}_start")
+                record_memory_with_peak_observation(f"measured_step_{step}_start", capture_peak=True)
                 if live_state_breakdown is not None:
                     measured_step_state_timeline.append({"label": f"measured_step_{step}_start", **live_state_breakdown()})
                 log_event(
@@ -339,7 +369,7 @@ def train(args: argparse.Namespace) -> None:
                     force=verbose_enabled or args.verbose_memory,
                 )
         elif sample_this_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"step_{step}_start")
+            record_memory_with_peak_observation(f"step_{step}_start", capture_peak=False)
             log_event(
                 rank,
                 f"recorded memory snapshot step_{step}_start {format_device_memory(device)}",
@@ -352,7 +382,7 @@ def train(args: argparse.Namespace) -> None:
             prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
             log_event(rank, f"step={step} prepare_forward end prepare_comm_ms={prepare_comm_ms:.2f}", force=verbose_enabled)
         if is_measured_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"measured_step_{step}_post_prepare")
+            record_memory_with_peak_observation(f"measured_step_{step}_post_prepare", capture_peak=True)
             if live_state_breakdown is not None:
                 measured_step_state_timeline.append({"label": f"measured_step_{step}_post_prepare", **live_state_breakdown()})
             log_event(
@@ -361,7 +391,7 @@ def train(args: argparse.Namespace) -> None:
                 force=verbose_enabled or args.verbose_memory,
             )
         elif sample_this_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"step_{step}_post_prepare")
+            record_memory_with_peak_observation(f"step_{step}_post_prepare", capture_peak=False)
             log_event(
                 rank,
                 f"recorded memory snapshot step_{step}_post_prepare {format_device_memory(device)}",
@@ -393,7 +423,7 @@ def train(args: argparse.Namespace) -> None:
                     scaled_loss = loss / args.grad_accum_steps
 
                 if is_measured_step and should_record_memory and rank_profile_enabled:
-                    memory.record(f"measured_step_{step}_micro_{micro_idx + 1}_after_forward")
+                    record_memory_with_peak_observation(f"measured_step_{step}_micro_{micro_idx + 1}_after_forward", capture_peak=True)
                     if live_state_breakdown is not None:
                         measured_step_state_timeline.append({"label": f"measured_step_{step}_micro_{micro_idx + 1}_after_forward", **live_state_breakdown()})
                     log_event(
@@ -405,7 +435,7 @@ def train(args: argparse.Namespace) -> None:
                 micro_losses_local.append(float(loss.detach().float().item()))
                 engine.backward(scaled_loss)
                 if is_measured_step and should_record_memory and rank_profile_enabled:
-                    memory.record(f"measured_step_{step}_micro_{micro_idx + 1}_after_backward")
+                    record_memory_with_peak_observation(f"measured_step_{step}_micro_{micro_idx + 1}_after_backward", capture_peak=True)
                     if live_state_breakdown is not None:
                         measured_step_state_timeline.append({"label": f"measured_step_{step}_micro_{micro_idx + 1}_after_backward", **live_state_breakdown()})
                     log_event(
@@ -414,7 +444,7 @@ def train(args: argparse.Namespace) -> None:
                         force=verbose_enabled or args.verbose_memory,
                     )
                 elif sample_this_step and should_record_memory and rank_profile_enabled:
-                    memory.record(f"step_{step}_micro_{micro_idx + 1}_post_backward")
+                    record_memory_with_peak_observation(f"step_{step}_micro_{micro_idx + 1}_post_backward", capture_peak=False)
                     log_event(
                         rank,
                         f"recorded memory snapshot step_{step}_micro_{micro_idx + 1}_post_backward {format_device_memory(device)}",
@@ -432,7 +462,7 @@ def train(args: argparse.Namespace) -> None:
 
         fwd_bwd_ms = fwd_bwd_timer.stop()
         if is_measured_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"measured_step_{step}_post_backward")
+            record_memory_with_peak_observation(f"measured_step_{step}_post_backward", capture_peak=True)
             if live_state_breakdown is not None:
                 measured_step_state_timeline.append({"label": f"measured_step_{step}_post_backward", **live_state_breakdown()})
             log_event(
@@ -441,7 +471,7 @@ def train(args: argparse.Namespace) -> None:
                 force=verbose_enabled or args.verbose_memory,
             )
         elif sample_this_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"step_{step}_post_backward")
+            record_memory_with_peak_observation(f"step_{step}_post_backward", capture_peak=False)
             log_event(
                 rank,
                 f"recorded memory snapshot step_{step}_post_backward {format_device_memory(device)}",
@@ -457,7 +487,7 @@ def train(args: argparse.Namespace) -> None:
         grad_norm_value = float(step_stats["grad_norm"])
         comm_ms = float(step_stats["comm_ms"]) + prepare_comm_ms
         if is_measured_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"measured_step_{step}_post_optimizer")
+            record_memory_with_peak_observation(f"measured_step_{step}_post_optimizer", capture_peak=True)
             if live_state_breakdown is not None:
                 measured_step_state_timeline.append({"label": f"measured_step_{step}_post_optimizer", **live_state_breakdown()})
             log_event(
@@ -466,7 +496,7 @@ def train(args: argparse.Namespace) -> None:
                 force=verbose_enabled or args.verbose_memory,
             )
         elif sample_this_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"step_{step}_post_optimizer")
+            record_memory_with_peak_observation(f"step_{step}_post_optimizer", capture_peak=False)
             log_event(
                 rank,
                 f"recorded memory snapshot step_{step}_post_optimizer {format_device_memory(device)}",
@@ -522,7 +552,7 @@ def train(args: argparse.Namespace) -> None:
             )
 
         if is_measured_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"measured_step_{step}_end")
+            record_memory_with_peak_observation(f"measured_step_{step}_end", capture_peak=True)
             if live_state_breakdown is not None:
                 measured_step_state_timeline.append({"label": f"measured_step_{step}_end", **live_state_breakdown()})
             peak_stats = memory.peak_stats_mb()
@@ -532,6 +562,8 @@ def train(args: argparse.Namespace) -> None:
                 "peak_allocated_mb": float(peak_stats["peak_allocated_mb"]),
                 "peak_reserved_mb": float(peak_stats["peak_reserved_mb"]),
             }
+            if measured_step_peak_observation is not None:
+                measured_step_memory["peak_observation"] = measured_step_peak_observation
             if hasattr(engine, "memory_trace_active"):
                 engine.memory_trace_active = False
             log_event(
@@ -543,7 +575,7 @@ def train(args: argparse.Namespace) -> None:
                 force=verbose_enabled or args.verbose_memory,
             )
         elif sample_this_step and should_record_memory and rank_profile_enabled:
-            memory.record(f"step_{step}_end")
+            record_memory_with_peak_observation(f"step_{step}_end", capture_peak=False)
             log_event(
                 rank,
                 f"recorded memory snapshot step_{step}_end {format_device_memory(device)}",

@@ -9,25 +9,48 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_ROOT = PROJECT_ROOT / "experiments" / "results"
 
+DEFAULT_MODEL_SIZE = "small"
+DEFAULT_SEQ_LEN = 512
+DEFAULT_BATCH_SIZE = 44
+DEFAULT_GRAD_ACCUM_STEPS = 1
+DEFAULT_STEPS = 20
+DEFAULT_DTYPE = "bfloat16"
+DEFAULT_MEASURE_MEMORY_STEP = True
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a ZeRO stage memory comparison sweep")
-    parser.add_argument("--name", type=str, default="", help="Optional run name. Defaults to a batch-size-specific name.")
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="memory_comparison",
+        help="Optional run name. If omitted, use the project memory-comparison preset name.",
+    )
     parser.add_argument("--results-dir", type=str, default=str(RESULTS_ROOT))
-    parser.add_argument("--model-size", type=str, default="small", choices=["tiny", "small", "medium"])
-    parser.add_argument("--seq-len", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=10)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--model-size", type=str, default=DEFAULT_MODEL_SIZE, choices=["tiny", "small", "medium"])
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--grad-accum-steps", type=int, default=DEFAULT_GRAD_ACCUM_STEPS)
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    parser.add_argument("--dtype", type=str, default=DEFAULT_DTYPE, choices=["float32", "bfloat16"])
     parser.add_argument("--nproc-per-node", type=int, default=0, help="If omitted, use all visible GPUs.")
     parser.add_argument("--profile-memory-interval", type=int, default=1)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port-base", type=int, default=29500)
     parser.add_argument("--case-timeout-s", type=float, default=1800.0)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--measure-memory-step", action="store_true", help="Warm up a few steps, then record one measured step with reset CUDA peak stats.")
-    parser.add_argument("--memory-warmup-steps", type=int, default=3)
+    parser.add_argument(
+        "--measure-memory-step",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MEASURE_MEMORY_STEP,
+        help="Warm up a few steps, then record one measured step with reset CUDA peak stats.",
+    )
+    parser.add_argument(
+        "--memory-warmup-steps",
+        type=int,
+        default=None,
+        help="If omitted, use steps - 1 when measured-step mode is enabled.",
+    )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -50,7 +73,8 @@ def detect_visible_gpus() -> int:
 
 
 def default_run_name(args: argparse.Namespace) -> str:
-    return f"{args.model_size}_memory_bs{args.batch_size}_allgpus"
+    suffix = "measured_step" if args.measure_memory_step else "train"
+    return f"{args.model_size}_memory_{suffix}_bs{args.batch_size}_allgpus_project"
 
 
 def run_command(cmd: list[str]) -> None:
@@ -61,6 +85,10 @@ def run_command(cmd: list[str]) -> None:
 
 def main() -> None:
     args = parse_args()
+    warmup_steps = args.memory_warmup_steps
+    if args.measure_memory_step and warmup_steps is None:
+        warmup_steps = max(args.steps - 1, 0)
+
     nproc_per_node = args.nproc_per_node if args.nproc_per_node > 0 else detect_visible_gpus()
     if nproc_per_node < 1:
         raise SystemExit("No visible GPUs detected. Set CUDA_VISIBLE_DEVICES or pass --nproc-per-node.")
@@ -81,11 +109,11 @@ def main() -> None:
     steps = args.steps
     extra_train_args: list[str] = []
     if args.measure_memory_step:
-        steps = args.memory_warmup_steps + 1
+        steps = warmup_steps + 1
         extra_train_args.extend([
             "--measure-memory-step",
             "--memory-warmup-steps",
-            str(args.memory_warmup_steps),
+            str(warmup_steps),
         ])
 
     harness_cmd = [
@@ -184,27 +212,13 @@ def main() -> None:
         "--output",
         str(run_dir / "avg_memory.png"),
     ]
-    loss_plot_cmd = [
-        sys.executable,
-        str(PROJECT_ROOT / "analysis" / "visualize.py"),
-        "--run-dir",
-        str(run_dir),
-        "--plot",
-        "loss",
-        "--model-size",
-        args.model_size,
-        "--output",
-        str(run_dir / "loss.png"),
-    ]
     run_command(memory_plot_cmd)
     run_command(peak_plot_cmd)
     run_command(avg_plot_cmd)
-    run_command(loss_plot_cmd)
 
     print(f"[memory-sweep] wrote {run_dir / 'memory.png'}", flush=True)
     print(f"[memory-sweep] wrote {run_dir / 'peak_memory.png'}", flush=True)
     print(f"[memory-sweep] wrote {run_dir / 'avg_memory.png'}", flush=True)
-    print(f"[memory-sweep] wrote {run_dir / 'loss.png'}", flush=True)
 
 
 if __name__ == "__main__":

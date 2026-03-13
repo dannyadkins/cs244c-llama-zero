@@ -362,7 +362,7 @@ def _stage2_sharded_grad_worker(rank: int, world_size: int, port: int) -> None:
         measured = engine.memory_state_breakdown_mb()
         full_grad_mb = sum(param.numel() * 4 for param in model.parameters()) / (1024.0 * 1024.0)
         assert measured["grads_mb"] < full_grad_mb
-        assert measured["grads_mb"] == 0.0
+        assert measured["grads_mb"] > 0.0
     finally:
         dist.barrier()
         dist.destroy_process_group()
@@ -397,15 +397,52 @@ def test_stage2_memory_trace_records_internal_labels_world1() -> None:
     engine.step()
 
     labels = [item["label"] for item in timeline]
-    assert labels == [
-        "measured_step_stage2_bucket0_ready",
-        "measured_step_stage2_bucket0_pre_reduce_scatter",
-        "measured_step_stage2_bucket0_post_reduce_scatter",
-        "measured_step_stage2_bucket0_post_free",
+    ready_labels = [label for label in labels if label.endswith("_ready")]
+    pre_labels = [label for label in labels if label.endswith("_pre_reduce_scatter")]
+    post_reduce_labels = [label for label in labels if label.endswith("_post_reduce_scatter")]
+    post_free_labels = [label for label in labels if label.endswith("_post_free")]
+
+    assert ready_labels
+    assert len(ready_labels) == len(pre_labels) == len(post_reduce_labels) == len(post_free_labels)
+    assert labels[-3:] == [
         "measured_step_stage2_pre_allgather",
         "measured_step_stage2_post_allgather",
         "measured_step_stage2_post_step_free_grad_shard",
     ]
+
+    for item in timeline:
+        label = item["label"]
+        if label.endswith("_ready"):
+            assert item["live_full_grads_mb"] > 0.0
+            assert item["comm_temp_mb"] == 0.0
+        elif label.endswith("_pre_reduce_scatter"):
+            assert item["live_full_grads_mb"] == 0.0
+            assert item["comm_temp_mb"] > 0.0
+        elif label.endswith("_post_reduce_scatter"):
+            assert item["live_full_grads_mb"] == 0.0
+            assert item["comm_temp_mb"] > 0.0
+        elif label.endswith("_post_free"):
+            assert item["live_full_grads_mb"] == 0.0
+            assert item["comm_temp_mb"] == 0.0
+
+
+def test_stage2_logical_state_breakdown_keeps_grad_shard_after_step_world1() -> None:
+    cfg = _test_config()
+    model = LlamaForCausalLM(cfg)
+    engine = ZeROStage2Optimizer(model=model, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+
+    local_ids = _local_batch(step=0, rank=0, batch_size=3, seq_len=cfg.max_seq_len, vocab_size=cfg.vocab_size)
+    engine.zero_grad()
+    engine.prepare_forward()
+    loss = model(input_ids=local_ids, labels=local_ids).loss
+    assert loss is not None
+    engine.backward(loss)
+    engine.step()
+
+    logical = engine.memory_state_breakdown_mb()
+    live = engine.live_model_state_breakdown_mb()
+    assert logical["grads_mb"] > 0.0
+    assert live["grads_mb"] == 0.0
 
 
 def test_stage3_live_state_breakdown_includes_local_param_shards_world1() -> None:

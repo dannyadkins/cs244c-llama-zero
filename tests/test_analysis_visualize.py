@@ -164,6 +164,46 @@ def test_case_peak_breakdown_uses_measured_state_total() -> None:
     assert visualize._case_peak_breakdown_mb(case) == (150.0, 183.0)
 
 
+def test_case_peak_breakdown_prefers_logical_state_over_live_peak_state(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "memory": [
+                    {"label": "measured_step_1_peak", "cuda_allocated_mb": 210.0, "cuda_max_allocated_mb": 260.0},
+                ],
+                "measured_step_state_timeline": [
+                    {"label": "measured_step_1_peak", "params_mb": 60.0, "grads_mb": 80.0, "optimizer_mb": 40.0, "total_mb": 180.0},
+                ],
+            }
+        )
+    )
+
+    case = visualize.CaseView(
+        stage=2,
+        model_size="tiny",
+        bandwidth_gbps=0.0,
+        log_path=Path("/tmp/missing.log"),
+        profile_path=profile_path,
+        mean_tokens_per_s=None,
+        mean_tflops_per_s=None,
+        mean_comm_ms=None,
+        mean_fb_ms=None,
+        mean_opt_ms=None,
+        peak_host_rss_mb=None,
+        peak_cuda_allocated_mb=210.0,
+        peak_cuda_reserved_mb=None,
+        peak_cuda_max_allocated_mb=260.0,
+        peak_cuda_max_reserved_mb=None,
+        final_loss=None,
+        return_code=0,
+        measured_state_memory_mb={"params_mb": 60.0, "grads_mb": 20.0, "optimizer_mb": 40.0, "total_mb": 120.0},
+        theoretical_memory_mb=None,
+    )
+
+    assert visualize._case_peak_breakdown_mb(case) == (120.0, 140.0)
+
+
 def test_representative_cases_prefer_unlimited_baseline() -> None:
     base = dict(
         model_size="tiny",

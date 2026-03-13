@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -26,31 +26,19 @@ from .common import (
 
 
 @dataclass
-class _Stage2GradBucket:
+class _Stage2GradPartition:
     index: int
-    param_indices: List[int]
+    param_idx: int
     start: int
     end: int
     rank_piece_numels: List[int]
     packed_chunk_numel: int
     local_piece_numel: int
     local_shard_offset: int
-    pending_params: int = 0
-    ready_mask: List[bool] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        if not self.ready_mask:
-            self.ready_mask = [False for _ in self.param_indices]
-        self.pending_params = len(self.param_indices)
 
     @property
     def numel(self) -> int:
         return self.end - self.start
-
-    def reset(self) -> None:
-        self.pending_params = len(self.param_indices)
-        for idx in range(len(self.ready_mask)):
-            self.ready_mask[idx] = False
 
 
 @dataclass
@@ -83,14 +71,9 @@ class ZeROStage2Optimizer:
         self.exp_avg_sq = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
         self.grad_shard: Optional[torch.Tensor] = None
         self._backward_comm_ms = 0.0
-        self._bucket_target_numel = self.meta.total_numel
-        self._grad_buckets = self._build_grad_buckets()
-        self._param_to_bucket: Dict[int, int] = {}
-        self._param_to_bucket_offset: Dict[int, int] = {}
-        for bucket in self._grad_buckets:
-            for bucket_offset, param_idx in enumerate(bucket.param_indices):
-                self._param_to_bucket[param_idx] = bucket.index
-                self._param_to_bucket_offset[param_idx] = bucket_offset
+        self._live_comm_buffer_num_bytes = 0
+        self._logical_grad_shard_num_bytes = self.shard.shard_numel * torch.tensor([], dtype=torch.float32).element_size()
+        self._grad_partitions = self._build_grad_partitions()
         self._grad_hook_handles = self._register_grad_hooks()
 
     def backward(self, loss: torch.Tensor) -> None:
@@ -102,11 +85,10 @@ class ZeROStage2Optimizer:
 
     def zero_grad(self) -> None:
         self._backward_comm_ms = 0.0
+        self._live_comm_buffer_num_bytes = 0
         self.grad_shard = None
         for p in self.meta.params:
             p.grad = None
-        for bucket in self._grad_buckets:
-            bucket.reset()
 
     def _adamw_update(self, local_params: torch.Tensor, local_grads: torch.Tensor) -> torch.Tensor:
         self.step_count += 1
@@ -150,37 +132,22 @@ class ZeROStage2Optimizer:
         self.memory_tracker.record(label)
         if self.memory_state_timeline is None:
             return
-        self.memory_state_timeline.append({"label": label, **self.live_model_state_breakdown_mb()})
+        self.memory_state_timeline.append(
+            {
+                "label": label,
+                **self.live_model_state_breakdown_mb(),
+                **self._debug_memory_components_mb(),
+            }
+        )
 
-    def _build_grad_buckets(self) -> List[_Stage2GradBucket]:
-        buckets: List[_Stage2GradBucket] = []
-        current_indices: List[int] = []
-        current_start: Optional[int] = None
-        current_end: Optional[int] = None
-
+    def _build_grad_partitions(self) -> List[_Stage2GradPartition]:
+        partitions: List[_Stage2GradPartition] = []
         for param_idx, (param, start) in enumerate(zip(self.meta.params, self.meta.offsets)):
-            param_end = start + param.numel()
-            if current_start is None:
-                current_start = start
-                current_end = param_end
-                current_indices = [param_idx]
-                continue
+            end = start + param.numel()
+            partitions.append(self._make_partition(index=len(partitions), param_idx=param_idx, start=start, end=end))
+        return partitions
 
-            if (current_end - current_start) >= self._bucket_target_numel:
-                buckets.append(self._make_bucket(index=len(buckets), param_indices=current_indices, start=current_start, end=current_end))
-                current_start = start
-                current_end = param_end
-                current_indices = [param_idx]
-                continue
-
-            current_indices.append(param_idx)
-            current_end = param_end
-
-        if current_indices and current_start is not None and current_end is not None:
-            buckets.append(self._make_bucket(index=len(buckets), param_indices=current_indices, start=current_start, end=current_end))
-        return buckets
-
-    def _make_bucket(self, index: int, param_indices: List[int], start: int, end: int) -> _Stage2GradBucket:
+    def _make_partition(self, index: int, param_idx: int, start: int, end: int) -> _Stage2GradPartition:
         rank_piece_numels: List[int] = []
         for rank in range(self.world_size):
             shard_start = rank * self.shard.chunk_size
@@ -192,9 +159,9 @@ class ZeROStage2Optimizer:
         local_overlap_start = max(start, self.shard.shard_start)
         local_overlap_end = min(end, self.shard.shard_end)
         local_piece_numel = max(0, local_overlap_end - local_overlap_start)
-        return _Stage2GradBucket(
+        return _Stage2GradPartition(
             index=index,
-            param_indices=list(param_indices),
+            param_idx=param_idx,
             start=start,
             end=end,
             rank_piece_numels=rank_piece_numels,
@@ -205,110 +172,127 @@ class ZeROStage2Optimizer:
 
     def _register_grad_hooks(self):
         handles = []
-        for param_idx, param in enumerate(self.meta.params):
-            def _hook(grad_param: torch.Tensor, *, _param_idx: int = param_idx) -> None:
+        for partition in self._grad_partitions:
+            param = self.meta.params[partition.param_idx]
+
+            def _hook(
+                grad_param: torch.Tensor,
+                *,
+                _partition_idx: int = partition.index,
+                _param_idx: int = partition.param_idx,
+            ) -> None:
                 del grad_param
-                bucket_idx = self._param_to_bucket[_param_idx]
-                bucket = self._grad_buckets[bucket_idx]
-                bucket_offset = self._param_to_bucket_offset[_param_idx]
-                if bucket.ready_mask[bucket_offset]:
+                if self.meta.params[_param_idx].grad is None:
                     return
-                bucket.ready_mask[bucket_offset] = True
-                bucket.pending_params -= 1
-                if bucket.pending_params == 0:
-                    self._flush_bucket(bucket_idx)
+                self._flush_partition(_partition_idx)
 
             handles.append(param.register_post_accumulate_grad_hook(_hook))
         return handles
 
-    def _pack_bucket_inputs(self, bucket: _Stage2GradBucket) -> torch.Tensor:
+    def _pack_partition_inputs(self, partition: _Stage2GradPartition) -> torch.Tensor:
         packed = torch.zeros(
-            self.world_size * bucket.packed_chunk_numel,
+            self.world_size * partition.packed_chunk_numel,
             dtype=torch.float32,
             device=self.meta.device,
         )
         chunk_views = [
-            packed[rank * bucket.packed_chunk_numel : (rank + 1) * bucket.packed_chunk_numel]
+            packed[rank * partition.packed_chunk_numel : (rank + 1) * partition.packed_chunk_numel]
             for rank in range(self.world_size)
         ]
         write_offsets = [0 for _ in range(self.world_size)]
 
-        for param_idx in bucket.param_indices:
-            param = self.meta.params[param_idx]
-            grad = param.grad
-            param_start = self.meta.offsets[param_idx]
-            param_end = param_start + param.numel()
-            flat_grad = None
-            if grad is not None:
-                flat_grad = grad.detach().view(-1)
-                if flat_grad.dtype != torch.float32:
-                    flat_grad = flat_grad.to(torch.float32)
+        param = self.meta.params[partition.param_idx]
+        grad = param.grad
+        if grad is None:
+            raise RuntimeError(f"partition {partition.index} was marked ready without a gradient tensor")
 
-            first_rank = param_start // self.shard.chunk_size
-            last_rank = (param_end - 1) // self.shard.chunk_size
-            for rank in range(first_rank, last_rank + 1):
-                shard_start = rank * self.shard.chunk_size
-                shard_end = min(shard_start + self.shard.chunk_size, self.meta.total_numel)
-                overlap_start = max(param_start, shard_start)
-                overlap_end = min(param_end, shard_end)
-                if overlap_end <= overlap_start:
-                    continue
-                piece_len = overlap_end - overlap_start
-                dst_start = write_offsets[rank]
-                dst_end = dst_start + piece_len
-                if flat_grad is not None:
-                    src_start = overlap_start - param_start
-                    src_end = src_start + piece_len
-                    chunk_views[rank][dst_start:dst_end].copy_(flat_grad[src_start:src_end])
-                write_offsets[rank] = dst_end
+        flat_grad = grad.detach().view(-1)
+        if flat_grad.dtype != torch.float32:
+            flat_grad = flat_grad.to(torch.float32)
 
-        for rank, piece_len in enumerate(bucket.rank_piece_numels):
+        first_rank = partition.start // self.shard.chunk_size
+        last_rank = (partition.end - 1) // self.shard.chunk_size
+        for rank in range(first_rank, last_rank + 1):
+            shard_start = rank * self.shard.chunk_size
+            shard_end = min(shard_start + self.shard.chunk_size, self.meta.total_numel)
+            overlap_start = max(partition.start, shard_start)
+            overlap_end = min(partition.end, shard_end)
+            if overlap_end <= overlap_start:
+                continue
+            piece_len = overlap_end - overlap_start
+            dst_start = write_offsets[rank]
+            dst_end = dst_start + piece_len
+            src_start = overlap_start - partition.start
+            src_end = src_start + piece_len
+            chunk_views[rank][dst_start:dst_end].copy_(flat_grad[src_start:src_end])
+            write_offsets[rank] = dst_end
+
+        for rank, piece_len in enumerate(partition.rank_piece_numels):
             if write_offsets[rank] != piece_len:
                 raise RuntimeError(
-                    f"bucket {bucket.index} packed wrong numel for rank {rank}: {write_offsets[rank]} != {piece_len}"
+                    f"partition {partition.index} packed wrong numel for rank {rank}: {write_offsets[rank]} != {piece_len}"
                 )
         return packed
 
-    def _free_bucket_grads(self, bucket: _Stage2GradBucket) -> None:
-        for param_idx in bucket.param_indices:
-            self.meta.params[param_idx].grad = None
+    def _free_partition_grad(self, partition: _Stage2GradPartition) -> None:
+        self.meta.params[partition.param_idx].grad = None
 
-    def _flush_bucket(self, bucket_idx: int) -> None:
-        bucket = self._grad_buckets[bucket_idx]
-        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_ready")
-        packed = self._pack_bucket_inputs(bucket)
-        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_pre_reduce_scatter")
+    def _flush_partition(self, partition_idx: int) -> None:
+        partition = self._grad_partitions[partition_idx]
+        if self.meta.params[partition.param_idx].grad is None:
+            return
+
+        self._record_memory_event(f"measured_step_stage2_bucket{partition.index}_ready")
+        packed = self._pack_partition_inputs(partition)
+        self._free_partition_grad(partition)
+        self._live_comm_buffer_num_bytes = tensors_num_bytes([packed])
+        self._record_memory_event(f"measured_step_stage2_bucket{partition.index}_pre_reduce_scatter")
 
         t_comm0 = time.perf_counter()
         reduced_shard = self.collectives.reduce_scatter(packed)
         reduced_shard = reduced_shard / self.world_size
         self._backward_comm_ms += (time.perf_counter() - t_comm0) * 1000.0
+        self._live_comm_buffer_num_bytes = tensors_num_bytes([packed, reduced_shard])
 
-        if bucket.local_piece_numel > 0:
-            if reduced_shard.numel() < bucket.local_piece_numel:
+        if partition.local_piece_numel > 0:
+            if reduced_shard.numel() < partition.local_piece_numel:
                 raise ValueError(
-                    f"bucket {bucket.index} reduce_scatter returned too few elements: "
-                    f"{reduced_shard.numel()} < {bucket.local_piece_numel}"
+                    f"partition {partition.index} reduce_scatter returned too few elements: "
+                    f"{reduced_shard.numel()} < {partition.local_piece_numel}"
                 )
-            start = bucket.local_shard_offset
-            end = start + bucket.local_piece_numel
+            start = partition.local_shard_offset
+            end = start + partition.local_piece_numel
             grad_shard = self._ensure_grad_shard()
-            grad_shard[start:end].add_(reduced_shard[: bucket.local_piece_numel])
+            grad_shard[start:end].add_(reduced_shard[: partition.local_piece_numel])
 
-        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_post_reduce_scatter")
-        self._free_bucket_grads(bucket)
+        self._record_memory_event(f"measured_step_stage2_bucket{partition.index}_post_reduce_scatter")
         del packed
         del reduced_shard
-        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_post_free")
-        bucket.reset()
+        self._live_comm_buffer_num_bytes = 0
+        self._record_memory_event(f"measured_step_stage2_bucket{partition.index}_post_free")
 
     def _flush_pending_buckets(self, force: bool = False) -> None:
-        for bucket_idx, bucket in enumerate(self._grad_buckets):
-            if bucket.pending_params == len(bucket.param_indices):
+        del force
+        for partition_idx, partition in enumerate(self._grad_partitions):
+            if self.meta.params[partition.param_idx].grad is None:
                 continue
-            if not force and bucket.pending_params != 0:
-                continue
-            self._flush_bucket(bucket_idx)
+            self._flush_partition(partition_idx)
+
+    def _debug_memory_components_mb(self) -> Dict[str, float]:
+        live_full_grads_num_bytes = grads_num_bytes(self.meta.params)
+        live_grad_shard_num_bytes = tensors_num_bytes([self.grad_shard])
+        comm_temp_mb = bytes_to_mb(self._live_comm_buffer_num_bytes)
+        return {
+            "logical_params_mb": bytes_to_mb(params_num_bytes(self.meta.params)),
+            "logical_grads_mb": bytes_to_mb(self._logical_grad_shard_num_bytes),
+            "logical_optimizer_mb": bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq])),
+            "live_full_grads_mb": bytes_to_mb(live_full_grads_num_bytes),
+            "live_grad_shard_mb": bytes_to_mb(live_grad_shard_num_bytes),
+            "comm_temp_mb": comm_temp_mb,
+        }
+
+    def debug_memory_components_mb(self) -> Dict[str, float]:
+        return self._debug_memory_components_mb()
 
     def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
         t0 = time.perf_counter()
@@ -346,7 +330,7 @@ class ZeROStage2Optimizer:
 
     def memory_state_breakdown_mb(self) -> Dict[str, float]:
         params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
-        grads_mb = bytes_to_mb(tensors_num_bytes([self.grad_shard]))
+        grads_mb = bytes_to_mb(self._logical_grad_shard_num_bytes)
         optimizer_mb = bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq]))
         return {
             "params_mb": params_mb,
@@ -375,7 +359,7 @@ class ZeROStage2Optimizer:
             "shard_end": self.shard.shard_end,
             "exp_avg": self.exp_avg.detach().cpu(),
             "exp_avg_sq": self.exp_avg_sq.detach().cpu(),
-            "grad_shard": self.grad_shard.detach().cpu(),
+            "grad_shard": None if self.grad_shard is None else self.grad_shard.detach().cpu(),
             "hparams": {
                 "lr": self.lr,
                 "betas": self.betas,

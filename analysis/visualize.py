@@ -183,24 +183,8 @@ def _case_peak_breakdown_mb(case: CaseView) -> tuple[float, float] | None:
     if peak_mb is None:
         return None
 
-    state_total_mb = 0.0
-    peak_snapshots = _measured_step_memory_snapshots(case)
-    peak_label = None
-    if peak_snapshots:
-        max_peak_seen = max(float(snapshot.get("cuda_max_allocated_mb", 0.0)) for snapshot in peak_snapshots)
-        for snapshot in peak_snapshots:
-            if abs(float(snapshot.get("cuda_max_allocated_mb", 0.0)) - max_peak_seen) < 1e-6:
-                peak_label = str(snapshot.get("label", ""))
-                break
-        if not peak_label:
-            peak_snapshot = max(peak_snapshots, key=lambda snapshot: float(snapshot.get("cuda_allocated_mb", 0.0)))
-            peak_label = str(peak_snapshot.get("label", ""))
-
-    state_map = _measured_step_state_map(case)
-    if peak_label and peak_label in state_map:
-        state_total_mb = state_map[peak_label]
-    elif case.measured_state_memory_mb is not None:
-        state_total_mb = float(case.measured_state_memory_mb.get("total_mb", 0.0))
+    logical_state = _case_logical_state_breakdown(case)
+    state_total_mb = 0.0 if logical_state is None else float(logical_state.get("total_mb", 0.0))
 
     state_component_mb = min(max(state_total_mb, 0.0), peak_mb)
     residual_component_mb = max(peak_mb - state_component_mb, 0.0)
@@ -315,6 +299,12 @@ def _case_post_backward_state_breakdown(case: CaseView) -> Dict[str, float] | No
                     "total_mb": float(item["total_mb"]),
                 }
     return case.measured_state_memory_mb
+
+
+def _case_logical_state_breakdown(case: CaseView) -> Dict[str, float] | None:
+    if case.measured_state_memory_mb is not None:
+        return case.measured_state_memory_mb
+    return _case_post_backward_state_breakdown(case)
 
 
 def _case_state_breakdown_at_peak_total(case: CaseView) -> Dict[str, float] | None:
@@ -582,14 +572,12 @@ def plot_measured_state_memory(cases: List[CaseView], output: Path) -> None:
     except ImportError as exc:
         raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
 
-    selected = _representative_cases_by_stage(
-        case for case in cases if case.return_code == 0 and _case_post_backward_state_breakdown(case) is not None
-    )
+    selected = _representative_cases_by_stage(case for case in cases if case.return_code == 0 and _case_logical_state_breakdown(case) is not None)
     if not selected:
         raise RuntimeError("No measured state memory data available in the selected cases")
 
     stages = [case.stage for case in selected]
-    breakdowns = [_case_post_backward_state_breakdown(case) for case in selected]
+    breakdowns = [_case_logical_state_breakdown(case) for case in selected]
     params = [breakdown["params_mb"] for breakdown in breakdowns]
     grads = [breakdown["grads_mb"] for breakdown in breakdowns]
     optimizer = [breakdown["optimizer_mb"] for breakdown in breakdowns]
@@ -601,7 +589,7 @@ def plot_measured_state_memory(cases: List[CaseView], output: Path) -> None:
     bars_optimizer = plt.bar(stages, optimizer, bottom=bottoms, label="optimizer", color="#C56B1A")
     plt.xticks(stages, [f"stage {stage}" for stage in stages])
     plt.ylabel("State memory (MB)")
-    plt.title("Post-Backward ZeRO State Memory by Stage")
+    plt.title("Logical ZeRO Model State Memory by Stage")
     plt.grid(True, axis="y", alpha=0.3)
     plt.legend()
 
@@ -653,8 +641,8 @@ def plot_peak_memory(cases: List[CaseView], output: Path) -> None:
     total_values = [state + residual for state, residual in zip(state_values, residual_values)]
 
     plt.figure(figsize=(8, 5))
-    bars_state = plt.bar(stages, state_values, color="#315A9A", label="model state")
-    bars_residual = plt.bar(stages, residual_values, bottom=state_values, color="#C56B1A", label="non-state residual")
+    bars_state = plt.bar(stages, state_values, color="#315A9A", label="logical model state")
+    bars_residual = plt.bar(stages, residual_values, bottom=state_values, color="#C56B1A", label="peak transient / residual")
     plt.xticks(stages, [f"stage {stage}" for stage in stages])
     plt.ylabel("Peak memory (MB)")
     plt.title("Measured Step Peak GPU Memory by ZeRO Stage")
