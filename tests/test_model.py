@@ -43,6 +43,27 @@ def test_forward_shape_and_backward() -> None:
     assert any(g is not None and torch.isfinite(g).all() for g in grads)
 
 
+def test_chunked_training_loss_matches_golden_value() -> None:
+    cfg = tiny_test_config()
+    torch.manual_seed(123)
+    model = LlamaForCausalLM(cfg)
+    model.set_loss_chunk_size(4)
+
+    input_ids = torch.tensor(
+        [
+            [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3],
+            [2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5],
+        ],
+        dtype=torch.long,
+    )
+
+    out = model(input_ids=input_ids, labels=input_ids, return_logits=False)
+
+    assert out.logits is None
+    assert out.loss is not None
+    torch.testing.assert_close(out.loss.detach(), torch.tensor(4.901787757873535), atol=1e-6, rtol=0.0)
+
+
 def test_chunked_training_loss_matches_full_loss_and_grads() -> None:
     cfg = tiny_test_config()
     torch.manual_seed(123)
