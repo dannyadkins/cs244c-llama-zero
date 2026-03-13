@@ -118,8 +118,23 @@ def _flatten_tensor_fp32(tensor: torch.Tensor) -> torch.Tensor:
     return flat.to(torch.float32)
 
 
+def _flatten_tensor_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    flat = tensor.detach().view(-1)
+    if flat.dtype == dtype:
+        return flat
+    return flat.to(dtype)
+
+
+def model_param_dtype(meta: FlatParamMetadata) -> torch.dtype:
+    return meta.params[0].dtype
+
+
 def flatten_params_fp32(meta: FlatParamMetadata) -> torch.Tensor:
     return torch.cat([_flatten_tensor_fp32(p.data) for p in meta.params], dim=0)
+
+
+def flatten_params_dtype(meta: FlatParamMetadata, dtype: torch.dtype) -> torch.Tensor:
+    return torch.cat([_flatten_tensor_dtype(p.data, dtype) for p in meta.params], dim=0)
 
 
 def flatten_param_shard_fp32(meta: FlatParamMetadata, shard_start: int, shard_end: int) -> torch.Tensor:
@@ -143,6 +158,27 @@ def flatten_param_shard_fp32(meta: FlatParamMetadata, shard_start: int, shard_en
     return shard
 
 
+def flatten_param_shard_dtype(meta: FlatParamMetadata, shard_start: int, shard_end: int, dtype: torch.dtype) -> torch.Tensor:
+    shard_numel = max(0, shard_end - shard_start)
+    if shard_numel == 0:
+        return torch.empty(0, dtype=dtype, device=meta.device)
+
+    shard = torch.empty(shard_numel, dtype=dtype, device=meta.device)
+    for p, start in zip(meta.params, meta.offsets):
+        param_end = start + p.numel()
+        overlap_start = max(start, shard_start)
+        overlap_end = min(param_end, shard_end)
+        if overlap_end <= overlap_start:
+            continue
+
+        flat = p.data.detach().view(-1)
+        src = flat[overlap_start - start : overlap_end - start]
+        if src.dtype != dtype:
+            src = src.to(dtype)
+        shard[overlap_start - shard_start : overlap_end - shard_start].copy_(src)
+    return shard
+
+
 def flatten_grads_fp32(meta: FlatParamMetadata) -> torch.Tensor:
     parts: List[torch.Tensor] = []
     for p in meta.params:
@@ -150,6 +186,16 @@ def flatten_grads_fp32(meta: FlatParamMetadata) -> torch.Tensor:
             parts.append(torch.zeros(p.numel(), dtype=torch.float32, device=p.device))
         else:
             parts.append(_flatten_tensor_fp32(p.grad))
+    return torch.cat(parts, dim=0)
+
+
+def flatten_grads_dtype(meta: FlatParamMetadata, dtype: torch.dtype) -> torch.Tensor:
+    parts: List[torch.Tensor] = []
+    for p in meta.params:
+        if p.grad is None:
+            parts.append(torch.zeros(p.numel(), dtype=dtype, device=p.device))
+        else:
+            parts.append(_flatten_tensor_dtype(p.grad, dtype))
     return torch.cat(parts, dim=0)
 
 

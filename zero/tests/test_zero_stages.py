@@ -484,15 +484,11 @@ def test_stage2_memory_trace_records_internal_labels_world1() -> None:
     engine.step()
 
     labels = [item["label"] for item in timeline]
-    ready_labels = [label for label in labels if label.endswith("_ready")]
     pre_labels = [label for label in labels if label.endswith("_pre_reduce_scatter")]
     post_reduce_labels = [label for label in labels if label.endswith("_post_reduce_scatter")]
-    post_free_labels = [label for label in labels if label.endswith("_post_free")]
 
-    assert ready_labels
-    assert 1 < len(engine._grad_buckets) < len(engine.meta.params)
-    assert len(ready_labels) == len(engine._grad_buckets)
-    assert len(ready_labels) == len(pre_labels) == len(post_reduce_labels) == len(post_free_labels)
+    assert len(pre_labels) == 1
+    assert len(post_reduce_labels) == 1
     assert labels[-3:] == [
         "measured_step_stage2_pre_allgather",
         "measured_step_stage2_post_allgather",
@@ -501,18 +497,18 @@ def test_stage2_memory_trace_records_internal_labels_world1() -> None:
 
     for item in timeline:
         label = item["label"]
-        if label.endswith("_ready"):
-            assert item["live_full_grads_mb"] > 0.0
-            assert item["comm_temp_mb"] == 0.0
-        elif label.endswith("_pre_reduce_scatter"):
+        if label.endswith("_pre_reduce_scatter"):
             assert item["live_full_grads_mb"] == 0.0
-            assert item["comm_temp_mb"] > 0.0
+            assert item["live_flat_grad_buffer_mb"] > 0.0
+            assert item["live_grad_shard_mb"] > 0.0
         elif label.endswith("_post_reduce_scatter"):
             assert item["live_full_grads_mb"] == 0.0
-            assert item["comm_temp_mb"] > 0.0
-        elif label.endswith("_post_free"):
+            assert item["live_flat_grad_buffer_mb"] > 0.0
+            assert item["live_grad_shard_mb"] > 0.0
+        elif label == "measured_step_stage2_post_step_free_grad_shard":
             assert item["live_full_grads_mb"] == 0.0
-            assert item["comm_temp_mb"] == 0.0
+            assert item["live_flat_grad_buffer_mb"] == 0.0
+            assert item["live_grad_shard_mb"] == 0.0
 
 
 def test_stage2_logical_state_breakdown_keeps_grad_shard_after_step_world1() -> None:

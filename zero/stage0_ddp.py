@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -10,20 +11,22 @@ import torch.nn as nn
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
 from profiler import MemoryTracker
 from .common import (
-    assign_flat_grads,
+    assign_flat_params,
     build_flat_param_metadata,
     bytes_to_mb,
-    flatten_grads_fp32,
+    flatten_grads_dtype,
+    flatten_params_fp32,
     get_rank_world_size,
     grads_num_bytes,
+    model_param_dtype,
     params_num_bytes,
-    tensor_num_bytes,
+    tensors_num_bytes,
 )
 
 
 @dataclass
 class ZeROStage0DDP:
-    """Stage 0 baseline: full replication + gradient allreduce + local AdamW step."""
+    """Stage 0 baseline: full replication + gradient allreduce + local AdamW update."""
 
     model: nn.Module
     lr: float = 3e-4
@@ -44,13 +47,11 @@ class ZeROStage0DDP:
             self.collectives = SendRecvCollectives() if world_size > 1 else LocalCollectives()
 
         self.meta = build_flat_param_metadata(self.model)
-        self.optimizer = torch.optim.AdamW(
-            self.meta.params,
-            lr=self.lr,
-            betas=self.betas,
-            eps=self.eps,
-            weight_decay=self.weight_decay,
-        )
+        self.param_dtype = model_param_dtype(self.meta)
+        self.master_params = flatten_params_fp32(self.meta)
+        self.exp_avg = torch.zeros_like(self.master_params)
+        self.exp_avg_sq = torch.zeros_like(self.master_params)
+        self.step_count = 0
 
     def backward(self, loss: torch.Tensor) -> None:
         loss.backward()
@@ -59,7 +60,8 @@ class ZeROStage0DDP:
         return {"prepare_comm_ms": 0.0}
 
     def zero_grad(self) -> None:
-        self.optimizer.zero_grad(set_to_none=True)
+        for param in self.meta.params:
+            param.grad = None
 
     def _clip_flat_grads_inplace(self, flat_grads: torch.Tensor, max_grad_norm: float) -> float:
         grad_norm = float(flat_grads.norm(2).item())
@@ -67,6 +69,23 @@ class ZeROStage0DDP:
             scale = max_grad_norm / (grad_norm + 1e-6)
             flat_grads.mul_(scale)
         return grad_norm
+
+    def _adamw_update(self, flat_grads: torch.Tensor) -> None:
+        self.step_count += 1
+        beta1, beta2 = self.betas
+
+        self.exp_avg.mul_(beta1).add_(flat_grads, alpha=1.0 - beta1)
+        self.exp_avg_sq.mul_(beta2).addcmul_(flat_grads, flat_grads, value=1.0 - beta2)
+
+        bias_correction1 = 1.0 - (beta1**self.step_count)
+        bias_correction2 = 1.0 - (beta2**self.step_count)
+
+        if self.weight_decay != 0.0:
+            self.master_params.mul_(1.0 - (self.lr * self.weight_decay))
+
+        denom = self.exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(self.eps)
+        step_size = self.lr / bias_correction1
+        self.master_params.addcdiv_(self.exp_avg, denom, value=-step_size)
 
     def _record_memory_event(self, label: str) -> None:
         if self.memory_tracker is None or not self.memory_trace_active:
@@ -78,22 +97,28 @@ class ZeROStage0DDP:
 
     def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
         t0 = time.perf_counter()
-        flat_grads = flatten_grads_fp32(self.meta)
+        flat_grads = flatten_grads_dtype(self.meta, dtype=self.param_dtype)
 
         self._record_memory_event("measured_step_stage0_pre_allreduce")
         t_comm0 = time.perf_counter()
-        reduced = self.collectives.allreduce(flat_grads, average=True)
+        synced_grads = self.collectives.allreduce_inplace(flat_grads, average=False)
         comm_ms = (time.perf_counter() - t_comm0) * 1000.0
         self._record_memory_event("measured_step_stage0_post_allreduce")
 
-        grad_norm = self._clip_flat_grads_inplace(reduced, max_grad_norm=max_grad_norm)
-
-        assign_flat_grads(self.meta, reduced)
+        averaged_grads = synced_grads.to(torch.float32)
+        if self.world_size > 1:
+            averaged_grads.div_(self.world_size)
+        grad_norm = self._clip_flat_grads_inplace(averaged_grads, max_grad_norm=max_grad_norm)
 
         t_opt0 = time.perf_counter()
-        self.optimizer.step()
+        self._adamw_update(averaged_grads)
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
+        assign_flat_params(self.meta, self.master_params)
         self._record_memory_event("measured_step_stage0_post_optimizer")
+
+        del averaged_grads
+        del synced_grads
+        del flat_grads
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         return {
@@ -107,15 +132,9 @@ class ZeROStage0DDP:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
 
     def memory_state_breakdown_mb(self) -> Dict[str, float]:
-        optimizer_bytes = 0
-        for state in self.optimizer.state.values():
-            for value in state.values():
-                if torch.is_tensor(value):
-                    optimizer_bytes += tensor_num_bytes(value)
-
         params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
         grads_mb = bytes_to_mb(grads_num_bytes(self.meta.params))
-        optimizer_mb = bytes_to_mb(optimizer_bytes)
+        optimizer_mb = bytes_to_mb(tensors_num_bytes([self.master_params, self.exp_avg, self.exp_avg_sq]))
         return {
             "params_mb": params_mb,
             "grads_mb": grads_mb,
@@ -128,10 +147,23 @@ class ZeROStage0DDP:
 
     def state_dict(self) -> Dict[str, object]:
         return {
-            "optimizer_state_dict": self.optimizer.state_dict(),
             "rank": self.rank,
             "world_size": self.world_size,
+            "step_count": self.step_count,
+            "master_params": self.master_params.detach().cpu(),
+            "exp_avg": self.exp_avg.detach().cpu(),
+            "exp_avg_sq": self.exp_avg_sq.detach().cpu(),
+            "hparams": {
+                "lr": self.lr,
+                "betas": self.betas,
+                "eps": self.eps,
+                "weight_decay": self.weight_decay,
+            },
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
-        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.step_count = int(state["step_count"])
+        self.master_params = state["master_params"].to(device=self.meta.device, dtype=torch.float32)
+        self.exp_avg = state["exp_avg"].to(device=self.meta.device, dtype=torch.float32)
+        self.exp_avg_sq = state["exp_avg_sq"].to(device=self.meta.device, dtype=torch.float32)
+        assign_flat_params(self.meta, self.master_params)

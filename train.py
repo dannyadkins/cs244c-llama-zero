@@ -154,6 +154,12 @@ def autocast_context(device: torch.device, dtype_name: str):
     return torch.autocast(device_type="cuda", dtype=target)
 
 
+def model_param_dtype(device: torch.device, dtype_name: str) -> torch.dtype:
+    if device.type != "cuda" or dtype_name == "float32":
+        return torch.float32
+    return torch.float16 if dtype_name == "float16" else torch.bfloat16
+
+
 def save_checkpoint(
     save_dir: str,
     step: int,
@@ -194,7 +200,7 @@ def train(args: argparse.Namespace) -> None:
     if detected_vocab_size != cfg.vocab_size:
         cfg = cfg.with_vocab_size(detected_vocab_size)
 
-    model = LlamaForCausalLM(cfg).to(device)
+    model = LlamaForCausalLM(cfg).to(device=device, dtype=model_param_dtype(device, args.dtype))
     model.set_loss_chunk_size(args.loss_chunk_size)
     model.set_activation_checkpointing(args.activation_checkpointing)
     optimizer = torch.optim.AdamW(

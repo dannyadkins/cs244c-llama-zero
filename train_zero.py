@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--stage2-grad-bucket-mb",
         type=float,
         default=64.0,
-        help="Approximate fp32 gradient bucket size for ZeRO stage 2 reduce-scatter bucketing.",
+        help="Compatibility knob only; the textbook ZeRO stage 2 path now uses one contiguous gradient buffer per backward pass.",
     )
 
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
@@ -144,6 +144,12 @@ def autocast_context(device: torch.device, dtype_name: str):
     if dtype_name == "float32":
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def model_param_dtype(device: torch.device, dtype_name: str) -> torch.dtype:
+    if device.type != "cuda" or dtype_name == "float32":
+        return torch.float32
+    return torch.bfloat16
 
 
 def configure_runtime(device: torch.device) -> None:
@@ -271,7 +277,7 @@ def train(args: argparse.Namespace) -> None:
         cfg = cfg.with_vocab_size(detected_vocab_size)
 
     log_event(rank, f"constructing model config={cfg.name}", force=verbose_enabled)
-    model = LlamaForCausalLM(cfg).to(device)
+    model = LlamaForCausalLM(cfg).to(device=device, dtype=model_param_dtype(device, args.dtype))
     model.set_loss_chunk_size(args.loss_chunk_size)
     model.set_activation_checkpointing(args.activation_checkpointing)
     log_event(

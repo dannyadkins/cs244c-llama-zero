@@ -22,6 +22,7 @@ from .common import (
     flatten_params_fp32,
     get_rank_world_size,
     grads_num_bytes,
+    model_param_dtype,
     params_num_bytes,
     tensors_num_bytes,
     unique_trainable_params,
@@ -29,12 +30,13 @@ from .common import (
 
 
 def _flatten_optional_grads(meta: FlatParamMetadata, grads: Sequence[Optional[torch.Tensor]]) -> torch.Tensor:
+    param_dtype = model_param_dtype(meta)
     parts: List[torch.Tensor] = []
     for param, grad in zip(meta.params, grads):
         if grad is None:
-            parts.append(torch.zeros(param.numel(), dtype=torch.float32, device=meta.device))
+            parts.append(torch.zeros(param.numel(), dtype=param_dtype, device=meta.device))
         else:
-            parts.append(grad.detach().view(-1).to(device=meta.device, dtype=torch.float32))
+            parts.append(grad.detach().view(-1).to(device=meta.device, dtype=param_dtype))
     return torch.cat(parts, dim=0)
 
 
@@ -48,8 +50,9 @@ class _Stage3ParamHandle:
     module_names: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.param_dtype = model_param_dtype(self.meta)
         full_params = flatten_params_fp32(self.meta)
-        self.local_param_shard = full_params[self.shard.shard_start : self.shard.shard_end].clone()
+        self.local_master_param_shard = full_params[self.shard.shard_start : self.shard.shard_end].clone()
         self.exp_avg = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
         self.exp_avg_sq = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
         self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
@@ -64,7 +67,7 @@ class _Stage3ParamHandle:
             return 0.0
 
         t0 = time.perf_counter()
-        full_params = self.collectives.allgather(self.local_param_shard)
+        full_params = self.collectives.allgather(self.local_master_param_shard.to(dtype=self.param_dtype))
         assign_flat_params(self.meta, full_params[: self.meta.total_numel])
         self.materialized = True
         return (time.perf_counter() - t0) * 1000.0
@@ -85,14 +88,16 @@ class _Stage3ParamHandle:
 
         t0 = time.perf_counter()
         reduced_shard = self.collectives.reduce_scatter(flat_grads)
-        reduced_shard = reduced_shard / self.world_size
         comm_ms = (time.perf_counter() - t0) * 1000.0
 
         expected = self.shard.shard_numel
         if reduced_shard.numel() < expected:
             raise ValueError(f"reduce_scatter returned too few elements: {reduced_shard.numel()} < {expected}")
 
-        self.grad_shard.add_(reduced_shard[:expected])
+        local_grads = reduced_shard[:expected].to(torch.float32)
+        if self.world_size > 1:
+            local_grads.div_(self.world_size)
+        self.grad_shard.add_(local_grads)
         return comm_ms
 
 
@@ -138,7 +143,10 @@ class _ShardedModuleFunction(torch.autograd.Function):
 
         runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_forward")
         forward_ms = runner.handle.materialize()
-        runner.engine._record_forward_allgather_ms(forward_ms, num_bytes=runner.handle.meta.total_numel * 4)
+        runner.engine._record_forward_allgather_ms(
+            forward_ms,
+            num_bytes=runner.handle.meta.total_numel * torch.tensor([], dtype=runner.handle.param_dtype).element_size(),
+        )
         runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_forward")
         with torch.no_grad():
             output = runner.module(*args)
@@ -169,7 +177,10 @@ class _ShardedModuleFunction(torch.autograd.Function):
 
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_backward")
             backward_allgather_ms = runner.handle.materialize()
-            runner.engine._record_backward_allgather_ms(backward_allgather_ms, num_bytes=runner.handle.meta.total_numel * 4)
+            runner.engine._record_backward_allgather_ms(
+                backward_allgather_ms,
+                num_bytes=runner.handle.meta.total_numel * torch.tensor([], dtype=runner.handle.param_dtype).element_size(),
+            )
             comm_ms = backward_allgather_ms
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_backward")
 
@@ -210,7 +221,10 @@ class _ShardedModuleFunction(torch.autograd.Function):
             param_grads = grads[len(grad_inputs) :]
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_layer_backward")
             rs_ms = runner.handle.accumulate_grad_shard(param_grads)
-            runner.engine._record_backward_reduce_scatter_ms(rs_ms, num_bytes=runner.handle.meta.total_numel * 4)
+            runner.engine._record_backward_reduce_scatter_ms(
+                rs_ms,
+                num_bytes=runner.handle.meta.total_numel * torch.tensor([], dtype=runner.handle.param_dtype).element_size(),
+            )
             comm_ms += rs_ms
             runner.handle.reshard()
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_reduce_scatter_discard")
@@ -437,7 +451,7 @@ class ZeROStage3Optimizer:
 
     def _adamw_update_handle(self, handle: _Stage3ParamHandle) -> None:
         beta1, beta2 = self.betas
-        local_params = handle.local_param_shard
+        local_params = handle.local_master_param_shard
         local_grads = handle.grad_shard
 
         handle.exp_avg.mul_(beta1).add_(local_grads, alpha=1.0 - beta1)
@@ -485,14 +499,16 @@ class ZeROStage3Optimizer:
         return float(self.step_with_stats(max_grad_norm=max_grad_norm)["grad_norm"])
 
     def memory_state_breakdown_mb(self) -> Dict[str, float]:
-        local_param_tensors = [handle.local_param_shard for handle in self._handle_order]
-        grad_tensors = [handle.grad_shard for handle in self._handle_order]
+        logical_param_bytes = 0
+        logical_grad_bytes = 0
         optimizer_tensors = []
         for handle in self._handle_order:
-            optimizer_tensors.extend([handle.exp_avg, handle.exp_avg_sq])
+            logical_param_bytes += handle.shard.shard_numel * torch.tensor([], dtype=handle.param_dtype).element_size()
+            logical_grad_bytes += handle.shard.shard_numel * torch.tensor([], dtype=handle.param_dtype).element_size()
+            optimizer_tensors.extend([handle.local_master_param_shard, handle.exp_avg, handle.exp_avg_sq])
 
-        params_mb = bytes_to_mb(tensors_num_bytes(local_param_tensors))
-        grads_mb = bytes_to_mb(tensors_num_bytes(grad_tensors))
+        params_mb = bytes_to_mb(logical_param_bytes)
+        grads_mb = bytes_to_mb(logical_grad_bytes)
         optimizer_mb = bytes_to_mb(tensors_num_bytes(optimizer_tensors))
         return {
             "params_mb": params_mb,
@@ -502,12 +518,16 @@ class ZeROStage3Optimizer:
         }
 
     def live_model_state_breakdown_mb(self) -> Dict[str, float]:
-        local_param_tensors = [handle.local_param_shard for handle in self._handle_order]
-        params_mb = bytes_to_mb(tensors_num_bytes(local_param_tensors) + params_num_bytes(self.model.parameters()))
-        grads_mb = bytes_to_mb(grads_num_bytes(self.model.parameters()) + tensors_num_bytes([handle.grad_shard for handle in self._handle_order]))
+        logical_param_bytes = 0
+        logical_grad_bytes = 0
+        for handle in self._handle_order:
+            logical_param_bytes += handle.shard.shard_numel * torch.tensor([], dtype=handle.param_dtype).element_size()
+            logical_grad_bytes += handle.shard.shard_numel * torch.tensor([], dtype=handle.param_dtype).element_size()
+        params_mb = bytes_to_mb(logical_param_bytes + params_num_bytes(self.model.parameters()))
+        grads_mb = bytes_to_mb(logical_grad_bytes + grads_num_bytes(self.model.parameters()))
         optimizer_tensors = []
         for handle in self._handle_order:
-            optimizer_tensors.extend([handle.exp_avg, handle.exp_avg_sq])
+            optimizer_tensors.extend([handle.local_master_param_shard, handle.exp_avg, handle.exp_avg_sq])
         optimizer_mb = bytes_to_mb(tensors_num_bytes(optimizer_tensors))
         return {
             "params_mb": params_mb,
@@ -526,7 +546,7 @@ class ZeROStage3Optimizer:
                     "module_names": list(handle.module_names),
                     "shard_start": handle.shard.shard_start,
                     "shard_end": handle.shard.shard_end,
-                    "local_param_shard": handle.local_param_shard.detach().cpu(),
+                    "local_master_param_shard": handle.local_master_param_shard.detach().cpu(),
                     "exp_avg": handle.exp_avg.detach().cpu(),
                     "exp_avg_sq": handle.exp_avg_sq.detach().cpu(),
                 }
@@ -547,7 +567,7 @@ class ZeROStage3Optimizer:
             if handle.name not in handle_state:
                 raise KeyError(f"missing stage3 handle state for '{handle.name}'")
             saved = handle_state[handle.name]
-            handle.local_param_shard = saved["local_param_shard"].to(device=handle.meta.device, dtype=torch.float32)
+            handle.local_master_param_shard = saved["local_master_param_shard"].to(device=handle.meta.device, dtype=torch.float32)
             handle.exp_avg = saved["exp_avg"].to(device=handle.meta.device, dtype=torch.float32)
             handle.exp_avg_sq = saved["exp_avg_sq"].to(device=handle.meta.device, dtype=torch.float32)
             handle.grad_shard.zero_()
