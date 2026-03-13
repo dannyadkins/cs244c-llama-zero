@@ -79,6 +79,36 @@ def test_parse_summary_week2_compat_schema(tmp_path: Path) -> None:
     assert case.profile_path is None
 
 
+def test_parse_summary_rebases_repo_relative_paths_into_run_dir(tmp_path: Path) -> None:
+    run_dir = tmp_path / "remote_4gpu_bandwidth_smoke"
+    logs_dir = run_dir / "logs"
+    profiles_dir = run_dir / "profiles"
+    logs_dir.mkdir(parents=True)
+    profiles_dir.mkdir(parents=True)
+    log_path = logs_dir / "case.log"
+    profile_path = profiles_dir / "case.json"
+    log_path.write_text("ok\n")
+    profile_path.write_text("{}")
+
+    payload = {
+        "results": [
+            {
+                "config": {"stage": 0, "model_size": "tiny", "bandwidth_gbps": 5.0},
+                "log_path": "experiments/results/remote_4gpu_bandwidth_smoke/logs/case.log",
+                "profile_path": "experiments/results/remote_4gpu_bandwidth_smoke/profiles/case.json",
+                "return_code": 0,
+            }
+        ]
+    }
+    summary_path = run_dir / "summary.json"
+    summary_path.write_text(json.dumps(payload))
+
+    cases = visualize.parse_summary(summary_path)
+
+    assert cases[0].log_path == log_path
+    assert cases[0].profile_path == profile_path
+
+
 def test_parse_loss_log_handles_missing_file(tmp_path: Path) -> None:
     missing = tmp_path / "missing.log"
     steps, losses = visualize.parse_loss_log(missing)

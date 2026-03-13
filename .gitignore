@@ -12,7 +12,10 @@ venv/
 experiments/results/*
 experiments/configs/*
 analysis/figures/*
+!experiments/results/.gitkeep
+!experiments/configs/.gitkeep
+!experiments/configs/*.json
+!analysis/figures/.gitkeep
 
 # bundle files
 *.tar.gz
-

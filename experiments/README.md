@@ -54,6 +54,12 @@ Every harness run writes to `experiments/results/<name>/`:
 - `logs/<case_id>.log`: stdout and stderr from the launched distributed job
 - `profiles/<case_id>.json`: rank-0 profile output by default
 
+The remote runner writes the pulled run under `experiments/results/remote/<host>/<name>/` and also generates:
+
+- `bandwidth_report.md`: compact markdown summary of best stage by bandwidth and per-stage slowdown
+- `remote_run_metadata.json`: remote workspace, config, host, and sync metadata
+- plot files such as `throughput.png`, `comm.png`, `tflops.png`, `stage_throughput.png`, and `stage_comm.png`
+
 Each case result can include:
 
 - final loss and number of logged steps
@@ -74,7 +80,11 @@ The main metrics in this repo are:
 - measured state memory: state memory attributed to params, grads, and optimizer state
 - peak memory: observed peak allocated or reserved memory during the run
 
+For bandwidth sweeps, use `--metrics-warmup-steps 1` or higher so mean throughput and communication exclude allocator and CUDA startup noise from step 1.
+
 Bandwidth in the standard local sweep is usually simulated. In that mode the harness sets `ZERO_SIM_BW_GBPS` and `ZERO_SIM_LATENCY_MS`, and the collective wrappers inject delay to emulate slower communication. A bandwidth value of `0` means no injected slowdown.
+
+For quick remote iteration, prefer `experiments/configs/remote_4gpu_small_bandwidth_fast.json`. It keeps only the useful bandwidth points around the knee (`0, 1, 2, 5, 10 Gbps`) and uses `12` steps with `2` warmup steps. The denser `remote_4gpu_small_bandwidth_simulated.json` config is still available when you want more detail above the knee.
 
 ## Recommended Evaluation Order
 
@@ -156,6 +166,13 @@ Expected pattern:
 - communication time should rise as bandwidth drops
 
 If the pattern is missing, debug before doing more runs.
+
+Fast sweep variant:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/harness.py \
+  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json
+```
 
 ### 3. Plot the Core Figures
 
@@ -358,7 +375,7 @@ Those are useful references for expected JSON structure and expected plot shapes
 Config-driven run:
 
 ```bash
-python3 experiments/harness.py --config experiments/configs/week3_smoke_matrix.json
+python3 experiments/harness.py --config experiments/configs/remote_4gpu_bandwidth_smoke.json
 ```
 
 Custom CLI sweep:
@@ -387,8 +404,9 @@ Harness config files are JSON with two top-level objects:
 
 Example files:
 
-- `experiments/configs/week3_smoke_matrix.json`
-- `experiments/configs/week3_medium_bandwidth.json`
+- `experiments/configs/remote_4gpu_bandwidth_smoke.json`
+- `experiments/configs/remote_4gpu_small_bandwidth_fast.json`
+- `experiments/configs/remote_4gpu_small_bandwidth_simulated.json`
 
 ## Bandwidth Modes
 
@@ -397,6 +415,33 @@ Example files:
 - `none`: runs without bandwidth manipulation
 
 Use `simulated` for local single-host evaluation unless you have explicitly validated `tc` on a real multi-host path.
+
+## Remote Single-Host Workflow
+
+When you have one multi-GPU machine and want a clean, repeatable simulated-bandwidth sweep, use the remote runner:
+
+```bash
+python3 experiments/run_remote_bandwidth_sweep.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
+  --overwrite-local
+```
+
+What it does:
+
+- packs the current local repo contents
+- uploads them into a fresh remote workspace without touching the dirty checkout on the remote machine
+- runs `experiments/harness.py` remotely with the chosen config
+- pulls the completed run directory back to `experiments/results/remote/<host>/<name>/`
+- generates standard plots plus `bandwidth_report.md`
+
+Recommended sequence:
+
+1. Run `remote_4gpu_bandwidth_smoke.json` first.
+2. Inspect `bandwidth_report.md` and `throughput.png`.
+3. Run `remote_4gpu_small_bandwidth_fast.json` for the default main dataset.
+4. Use `remote_4gpu_small_bandwidth_simulated.json` only when you want the denser 7-point curve.
 
 ## Idempotency And Launch Notes
 

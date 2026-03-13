@@ -35,6 +35,7 @@ def _base_args() -> argparse.Namespace:
         dtype="float32",
         max_grad_norm=0.0,
         profile_memory_interval=0,
+        metrics_warmup_steps=0,
         bandwidth_mode="simulated",
         sim_latency_ms=0.0,
         tc_interface="eth0",
@@ -70,6 +71,26 @@ def test_parse_step_metrics_extracts_means() -> None:
     assert metrics["mean_fb_ms"] == 15.0
     assert metrics["mean_comm_ms"] == 10.0
     assert metrics["mean_opt_ms"] == 3.0
+
+
+def test_parse_step_metrics_can_skip_warmup_steps() -> None:
+    log_text = "\n".join(
+        [
+            "[step 00001] loss=8.3000 avg100=8.3000 tokens/s=300 grad_norm=0.900 fb_ms=30.0 comm_ms=10.0 opt_ms=3.0 tflops=0.100",
+            "[step 00002] loss=8.1000 avg100=8.2000 tokens/s=900 grad_norm=1.100 fb_ms=12.0 comm_ms=4.0 opt_ms=2.0 tflops=0.400",
+            "[step 00003] loss=8.0000 avg100=8.1333 tokens/s=1,200 grad_norm=1.000 fb_ms=9.0 comm_ms=3.0 opt_ms=1.0 tflops=0.500",
+        ]
+    )
+
+    metrics = harness._parse_step_metrics(log_text, metrics_warmup_steps=1)
+
+    assert metrics["final_loss"] == 8.0
+    assert metrics["logged_steps"] == 3
+    assert metrics["mean_tokens_per_s"] == 1050.0
+    assert metrics["mean_tflops_per_s"] == 0.45
+    assert metrics["mean_fb_ms"] == 10.5
+    assert metrics["mean_comm_ms"] == 3.5
+    assert metrics["mean_opt_ms"] == 1.5
 
 
 def test_parse_profile_memory_extracts_peaks(tmp_path: Path) -> None:
@@ -175,6 +196,47 @@ def test_merge_config_file_overrides_defaults_and_matrix(tmp_path: Path) -> None
     assert merged.stages == [0, 1, 2, 3]
     assert merged.model_sizes == ["medium"]
     assert merged.bandwidth_gbps == [0.0, 1.0]
+
+
+def test_parse_args_uses_config_as_defaults_but_preserves_explicit_cli(tmp_path: Path) -> None:
+    cfg = {
+        "defaults": {
+            "name": "from_config",
+            "steps": 99,
+            "seq_len": 256,
+            "batch_size": 2,
+            "dtype": "bfloat16",
+        },
+        "matrix": {
+            "stages": [0, 1, 2, 3],
+            "model_sizes": ["medium"],
+            "bandwidth_gbps": [0.0, 1.0],
+        },
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    parsed = harness.parse_args(
+        [
+            "--config",
+            str(cfg_path),
+            "--name",
+            "from_cli",
+            "--steps",
+            "5",
+            "--bandwidth-gbps",
+            "5.0",
+        ]
+    )
+
+    assert parsed.name == "from_cli"
+    assert parsed.steps == 5
+    assert parsed.seq_len == 256
+    assert parsed.batch_size == 2
+    assert parsed.dtype == "bfloat16"
+    assert parsed.stages == [0, 1, 2, 3]
+    assert parsed.model_sizes == ["medium"]
+    assert parsed.bandwidth_gbps == [5.0]
 
 
 def test_theoretical_memory_monotonic_for_stages() -> None:

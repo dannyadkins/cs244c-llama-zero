@@ -42,6 +42,7 @@ class CaseConfig:
     dtype: str
     max_grad_norm: float
     profile_memory_interval: int
+    metrics_warmup_steps: int
     bandwidth_mode: str
     sim_latency_ms: float
     tc_interface: str
@@ -85,7 +86,7 @@ class LaunchConfig:
     case_timeout_s: float
 
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Week 3 experiment harness for ZeRO stages 0-3")
     parser.add_argument("--config", type=str, default="")
 
@@ -116,6 +117,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.0)
 
     parser.add_argument("--profile-memory-interval", type=int, default=0)
+    parser.add_argument(
+        "--metrics-warmup-steps",
+        type=int,
+        default=0,
+        help="Ignore this many logged training steps when computing mean step metrics.",
+    )
 
     parser.add_argument("--bandwidth-mode", type=str, default="simulated", choices=["simulated", "none", "tc"])
     parser.add_argument("--sim-latency-ms", type=float, default=0.0)
@@ -128,7 +135,34 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--extra-args", type=str, default="")
-    return parser.parse_args()
+    return parser
+
+
+def _apply_config_to_parser(parser: argparse.ArgumentParser, config_path: str) -> None:
+    payload = json.loads(Path(config_path).read_text())
+    defaults = payload.get("defaults", {})
+    matrix = payload.get("matrix", {})
+
+    parser_defaults: Dict[str, object] = {}
+    if isinstance(defaults, dict):
+        parser_defaults.update(defaults)
+    if isinstance(matrix, dict):
+        if "stages" in matrix:
+            parser_defaults["stages"] = matrix["stages"]
+        if "model_sizes" in matrix:
+            parser_defaults["model_sizes"] = matrix["model_sizes"]
+        if "bandwidth_gbps" in matrix:
+            parser_defaults["bandwidth_gbps"] = matrix["bandwidth_gbps"]
+    if parser_defaults:
+        parser.set_defaults(**parser_defaults)
+
+
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = _build_parser()
+    preliminary_args, _ = parser.parse_known_args(argv)
+    if preliminary_args.config:
+        _apply_config_to_parser(parser, preliminary_args.config)
+    return parser.parse_args(argv)
 
 
 def _merge_config_file(args: argparse.Namespace) -> argparse.Namespace:
@@ -190,6 +224,7 @@ def _build_cases(args: argparse.Namespace) -> List[CaseConfig]:
                 dtype=str(args.dtype),
                 max_grad_norm=float(args.max_grad_norm),
                 profile_memory_interval=int(args.profile_memory_interval),
+                metrics_warmup_steps=int(args.metrics_warmup_steps),
                 bandwidth_mode=str(args.bandwidth_mode),
                 sim_latency_ms=float(args.sim_latency_ms),
                 tc_interface=str(args.tc_interface),
@@ -244,37 +279,41 @@ def _theoretical_memory(case: CaseConfig) -> tuple[int, Dict[str, float]]:
     return num_params, breakdown
 
 
-def _parse_step_metrics(log_text: str) -> Dict[str, object]:
+def _parse_step_metrics(log_text: str, metrics_warmup_steps: int = 0) -> Dict[str, object]:
     losses: List[float] = []
-    tps: List[float] = []
-    tflops: List[float] = []
-    comm_ms: List[float] = []
-    fb_ms: List[float] = []
-    opt_ms: List[float] = []
+    step_rows: List[Dict[str, float | None]] = []
 
     for line in log_text.splitlines():
         m = STEP_RE.search(line)
         if not m:
             continue
         losses.append(float(m.group(2)))
-        tps.append(float(m.group(3).replace(",", "")))
-        if m.group(8) is not None:
-            tflops.append(float(m.group(8)))
-        fb_ms.append(float(m.group(5)))
-        comm_ms.append(float(m.group(6)))
-        opt_ms.append(float(m.group(7)))
+        step_rows.append(
+            {
+                "tokens_per_s": float(m.group(3).replace(",", "")),
+                "tflops_per_s": None if m.group(8) is None else float(m.group(8)),
+                "fb_ms": float(m.group(5)),
+                "comm_ms": float(m.group(6)),
+                "opt_ms": float(m.group(7)),
+            }
+        )
 
     def mean_or_none(xs: List[float]) -> float | None:
         return float(sum(xs) / len(xs)) if xs else None
 
+    if metrics_warmup_steps > 0:
+        step_rows = step_rows[metrics_warmup_steps:]
+
     return {
         "final_loss": losses[-1] if losses else None,
         "logged_steps": len(losses),
-        "mean_tokens_per_s": mean_or_none(tps),
-        "mean_tflops_per_s": mean_or_none(tflops),
-        "mean_comm_ms": mean_or_none(comm_ms),
-        "mean_fb_ms": mean_or_none(fb_ms),
-        "mean_opt_ms": mean_or_none(opt_ms),
+        "mean_tokens_per_s": mean_or_none([float(row["tokens_per_s"]) for row in step_rows]),
+        "mean_tflops_per_s": mean_or_none(
+            [float(row["tflops_per_s"]) for row in step_rows if row["tflops_per_s"] is not None]
+        ),
+        "mean_comm_ms": mean_or_none([float(row["comm_ms"]) for row in step_rows]),
+        "mean_fb_ms": mean_or_none([float(row["fb_ms"]) for row in step_rows]),
+        "mean_opt_ms": mean_or_none([float(row["opt_ms"]) for row in step_rows]),
     }
 
 
@@ -525,7 +564,7 @@ def _run_case(
     elapsed_s = time.perf_counter() - t0
     log_path.write_text(log_text)
 
-    metrics = _parse_step_metrics(log_text)
+    metrics = _parse_step_metrics(log_text, metrics_warmup_steps=case.metrics_warmup_steps)
     memory_metrics = _parse_profile_memory(profile_path)
     num_params, memory_mb = _theoretical_memory(case)
 
@@ -578,7 +617,7 @@ def _build_summary(results: List[CaseResult], args: argparse.Namespace) -> Dict[
 
 
 def main() -> None:
-    args = _merge_config_file(parse_args())
+    args = parse_args()
     launch = _launch_config_from_args(args)
 
     if shutil.which("tc") is None and args.bandwidth_mode == "tc":

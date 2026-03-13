@@ -33,10 +33,12 @@ For the current experiment status, runbook, and remaining execution plan, read `
 - `zero/stage3_optimizer.py`: module-wise Stage 3 parameter sharding/materialization with backward recomputation
 - `train_zero.py --zero-stage 3` integration
 - `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
+- `experiments/run_remote_bandwidth_sweep.py`: ship the current repo to an isolated remote workspace, run a sweep, sync results back, and generate plots + a markdown report
 - Simulated bandwidth mode via env-driven collective delay (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
 - Optional `tc` throttling mode integration in harness
 - Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
 - `analysis/visualize.py`: plots for throughput/communication vs bandwidth, loss curves, and measured/theoretical memory
+- `analysis/bandwidth_report.py`: markdown summary of best stage by bandwidth plus throughput/communication tables
 
 ## Repository Layout
 
@@ -108,7 +110,7 @@ python3 -m torch.distributed.run \
 Run a config-driven matrix:
 
 ```bash
-python3 experiments/harness.py --config experiments/configs/week3_smoke_matrix.json
+python3 experiments/harness.py --config experiments/configs/remote_4gpu_bandwidth_smoke.json
 ```
 
 Run a custom sweep directly from CLI:
@@ -134,6 +136,26 @@ python3 experiments/harness.py \
   --bandwidth-gbps 5 10 \
   --bandwidth-mode tc \
   --tc-interface eth0
+```
+
+Run the current branch on a remote GPU machine in an isolated workspace and pull the finished run back locally:
+
+```bash
+python3 experiments/run_remote_bandwidth_sweep.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
+  --overwrite-local
+```
+
+Use the denser 7-point bandwidth sweep only when you need more curve detail above the knee:
+
+```bash
+python3 experiments/run_remote_bandwidth_sweep.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_bandwidth_simulated.json \
+  --overwrite-local
 ```
 
 ## Visualization

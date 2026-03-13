@@ -87,18 +87,33 @@ def _result_profile_path(result: Dict[str, object]) -> Path | None:
     return Path(str(raw))
 
 
+def _resolve_run_path(run_dir: Path, raw_path: Path) -> Path:
+    if raw_path.is_absolute() or raw_path.exists():
+        return raw_path
+
+    if run_dir.name in raw_path.parts:
+        parts = raw_path.parts
+        idx = parts.index(run_dir.name)
+        rebased = run_dir.joinpath(*parts[idx + 1 :])
+        if rebased.exists():
+            return rebased
+
+    direct = run_dir / raw_path
+    if direct.exists():
+        return direct
+    return raw_path
+
+
 def parse_summary(summary_path: Path) -> List[CaseView]:
     summary = json.loads(summary_path.read_text())
     out: List[CaseView] = []
     run_dir = summary_path.parent
 
     for result in summary.get("results", []):
-        raw_log_path = _result_log_path(result)
-        if not raw_log_path.is_absolute() and not raw_log_path.exists():
-            raw_log_path = run_dir / raw_log_path
+        raw_log_path = _resolve_run_path(run_dir, _result_log_path(result))
         raw_profile_path = _result_profile_path(result)
-        if raw_profile_path is not None and not raw_profile_path.is_absolute() and not raw_profile_path.exists():
-            raw_profile_path = run_dir / raw_profile_path
+        if raw_profile_path is not None:
+            raw_profile_path = _resolve_run_path(run_dir, raw_profile_path)
 
         out.append(
             CaseView(
