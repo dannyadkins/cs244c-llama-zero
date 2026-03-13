@@ -6,6 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .config import ModelConfig
 
@@ -161,7 +162,7 @@ class TransformerBlock(nn.Module):
 
 @dataclass
 class CausalLMOutput:
-    logits: torch.Tensor
+    logits: Optional[torch.Tensor]
     loss: Optional[torch.Tensor] = None
 
 
@@ -181,6 +182,8 @@ class LlamaForCausalLM(nn.Module):
 
         self.apply(self._init_weights)
         self._zero3_executor = None
+        self.loss_chunk_size = 0
+        self.activation_checkpointing = False
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -188,11 +191,20 @@ class LlamaForCausalLM(nn.Module):
             if isinstance(module, nn.Linear) and module.bias is not None:
                 nn.init.zeros_(module.bias)
 
+    def set_loss_chunk_size(self, chunk_size: int) -> None:
+        if chunk_size < 0:
+            raise ValueError(f"loss chunk size must be non-negative, got {chunk_size}")
+        self.loss_chunk_size = int(chunk_size)
+
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        self.activation_checkpointing = bool(enabled)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        return_logits: bool = True,
     ) -> CausalLMOutput:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids should have shape [batch, seq], got {tuple(input_ids.shape)}")
@@ -200,11 +212,24 @@ class LlamaForCausalLM(nn.Module):
         x = self._call_parametrized_module("tok_embeddings", self.tok_embeddings, input_ids)
         x = self.dropout(x)
 
-        for layer_idx, layer in enumerate(self.layers):
-            x = self._call_parametrized_module(f"layers.{layer_idx}", layer, x, attention_mask)
+        for layer_idx in range(len(self.layers)):
+            if self._should_checkpoint_activations(x):
+                x = activation_checkpoint(
+                    lambda hidden_states, _layer_idx=layer_idx, _attention_mask=attention_mask: self._call_layer(
+                        _layer_idx,
+                        hidden_states,
+                        _attention_mask,
+                    ),
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x = self._call_layer(layer_idx, x, attention_mask)
 
         x = self._call_parametrized_module("norm", self.norm, x)
-        logits = self._call_parametrized_module("lm_head", self.lm_head, x)
+        logits = None
+        if labels is None or return_logits or not self._should_chunk_training_loss(input_ids):
+            logits = self._call_parametrized_module("lm_head", self.lm_head, x)
 
         loss = None
         if labels is not None:
@@ -212,15 +237,69 @@ class LlamaForCausalLM(nn.Module):
                 raise ValueError(
                     f"labels should have same shape as input_ids; got {tuple(labels.shape)} vs {tuple(input_ids.shape)}"
                 )
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            if logits is not None:
+                loss = self._full_cross_entropy(logits=logits, labels=labels)
+            else:
+                loss = self._chunked_cross_entropy(hidden_states=x, labels=labels)
+            if not return_logits:
+                logits = None
 
         return CausalLMOutput(logits=logits, loss=loss)
+
+    def _call_layer(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        layer = self.layers[layer_idx]
+        return self._call_parametrized_module(f"layers.{layer_idx}", layer, hidden_states, attention_mask)
+
+    def _should_checkpoint_activations(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self.activation_checkpointing
+            and self.training
+            and self._zero3_executor is None
+            and hidden_states.requires_grad
+        )
+
+    def _should_chunk_training_loss(self, input_ids: torch.Tensor) -> bool:
+        return (
+            self.loss_chunk_size > 0
+            and input_ids.size(1) > 1
+            and self._zero3_executor is None
+        )
+
+    def _full_cross_entropy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if logits.size(1) <= 1:
+            return logits.sum() * 0.0
+        return F.cross_entropy(
+            logits[:, :-1, :].transpose(1, 2),
+            labels[:, 1:],
+            ignore_index=-100,
+        )
+
+    def _chunked_cross_entropy(self, hidden_states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        seq_len = hidden_states.size(1)
+        if seq_len <= 1:
+            return hidden_states.sum() * 0.0
+
+        total_loss = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+        total_tokens = torch.zeros((), device=labels.device, dtype=torch.long)
+        for start in range(0, seq_len - 1, self.loss_chunk_size):
+            end = min(start + self.loss_chunk_size, seq_len - 1)
+            hidden_chunk = hidden_states[:, start:end, :]
+            label_chunk = labels[:, start + 1 : end + 1]
+            logits_chunk = self._call_parametrized_module("lm_head", self.lm_head, hidden_chunk)
+            total_loss = total_loss + F.cross_entropy(
+                logits_chunk.transpose(1, 2),
+                label_chunk,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_tokens = total_tokens + label_chunk.ne(-100).sum()
+
+        return total_loss / total_tokens.clamp_min(1).to(dtype=total_loss.dtype)
 
     def _call_parametrized_module(self, module_name: str, module: nn.Module, *args: Any) -> torch.Tensor:
         executor = self._zero3_executor
