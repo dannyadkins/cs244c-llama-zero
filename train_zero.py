@@ -67,6 +67,24 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--loss-chunk-size",
+        type=int,
+        default=128,
+        help="Sequence chunk size for LM-head projection during training loss; 0 disables chunking.",
+    )
+    parser.add_argument(
+        "--activation-checkpointing",
+        dest="activation_checkpointing",
+        action="store_true",
+        help="Enable per-block activation checkpointing on the standard autograd path.",
+    )
+    parser.add_argument(
+        "--no-activation-checkpointing",
+        dest="activation_checkpointing",
+        action="store_false",
+        help="Disable per-block activation checkpointing on the standard autograd path.",
+    )
 
     parser.add_argument("--data-mode", type=str, default="synthetic", choices=["fineweb", "synthetic"])
     parser.add_argument("--tokenizer-name", type=str, default="meta-llama/Llama-3.1-8B")
@@ -88,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--verbose-memory", action="store_true")
 
+    parser.set_defaults(activation_checkpointing=False)
     return parser.parse_args()
 
 
@@ -246,6 +265,16 @@ def train(args: argparse.Namespace) -> None:
 
     log_event(rank, f"constructing model config={cfg.name}", force=verbose_enabled)
     model = LlamaForCausalLM(cfg).to(device)
+    model.set_loss_chunk_size(args.loss_chunk_size)
+    model.set_activation_checkpointing(args.activation_checkpointing)
+    log_event(
+        rank,
+        (
+            f"model memory opts loss_chunk_size={args.loss_chunk_size} "
+            f"activation_checkpointing={args.activation_checkpointing}"
+        ),
+        force=verbose_enabled,
+    )
     log_event(rank, f"model moved to device {device} {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
     broadcast_model(model)
     log_event(rank, "model parameter broadcast complete", force=verbose_enabled)
@@ -416,7 +445,7 @@ def train(args: argparse.Namespace) -> None:
                 labels = batch.labels.to(device, non_blocking=True)
 
                 with autocast_context(device, args.dtype):
-                    out = model(input_ids=input_ids, labels=labels)
+                    out = model(input_ids=input_ids, labels=labels, return_logits=False)
                     loss = out.loss
                     if loss is None:
                         raise RuntimeError("Model did not return loss even though labels were provided")

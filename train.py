@@ -52,6 +52,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--loss-chunk-size",
+        type=int,
+        default=128,
+        help="Sequence chunk size for LM-head projection during training loss; 0 disables chunking.",
+    )
+    parser.add_argument(
+        "--activation-checkpointing",
+        action="store_true",
+        help="Enable per-block activation checkpointing during training.",
+    )
 
     parser.add_argument("--data-mode", type=str, default="fineweb", choices=["fineweb", "synthetic"])
     parser.add_argument("--tokenizer-name", type=str, default="meta-llama/Llama-3.1-8B")
@@ -184,6 +195,8 @@ def train(args: argparse.Namespace) -> None:
         cfg = cfg.with_vocab_size(detected_vocab_size)
 
     model = LlamaForCausalLM(cfg).to(device)
+    model.set_loss_chunk_size(args.loss_chunk_size)
+    model.set_activation_checkpointing(args.activation_checkpointing)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -225,7 +238,7 @@ def train(args: argparse.Namespace) -> None:
             labels = batch.labels.to(device, non_blocking=True)
 
             with autocast_context(device, args.dtype):
-                out = model(input_ids=input_ids, labels=labels)
+                out = model(input_ids=input_ids, labels=labels, return_logits=False)
                 loss = out.loss
                 if loss is None:
                     raise RuntimeError("Model did not return loss even though labels were provided")
