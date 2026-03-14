@@ -1,0 +1,24 @@
+{
+  "defaults": {
+    "name": "remote_4gpu_small_bandwidth_simulated",
+    "results_dir": "experiments/results",
+    "nproc_per_node": 4,
+    "steps": 30,
+    "seq_len": 128,
+    "batch_size": 4,
+    "grad_accum_steps": 1,
+    "collective_impl": "torch",
+    "data_mode": "synthetic",
+    "dtype": "bfloat16",
+    "profile_memory_interval": 0,
+    "metrics_warmup_steps": 1,
+    "bandwidth_mode": "simulated",
+    "sim_latency_ms": 0.0,
+    "case_timeout_s": 1800.0
+  },
+  "matrix": {
+    "stages": [0, 1, 2, 3],
+    "model_sizes": ["small"],
+    "bandwidth_gbps": [0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0]
+  }
+}

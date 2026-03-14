@@ -1,0 +1,33 @@
+{
+  "defaults": {
+    "name": "remote_4gpu_medium_fit_memory_socket",
+    "results_dir": "experiments/results",
+    "model_size": "medium",
+    "nproc_per_node": 4,
+    "steps": 8,
+    "seq_len": 128,
+    "grad_accum_steps": 1,
+    "collective_impl": "torch",
+    "data_mode": "synthetic",
+    "dtype": "bfloat16",
+    "stage2_grad_bucket_mb": 64.0,
+    "profile_memory_interval": 0,
+    "metrics_warmup_steps": 2,
+    "bandwidth_mode": "socket",
+    "sim_latency_ms": 0.0,
+    "socket_interface": "lo",
+    "socket_shaper_burst_bytes": 262144,
+    "case_timeout_s": 2400.0,
+    "memory_budget_fraction": 0.9,
+    "memory_metric": "peak_cuda_max_reserved_mb",
+    "tuning_memory_warmup_steps": 2,
+    "min_batch_size": 1,
+    "max_batch_size": 32,
+    "batch_size_multiple": 1,
+    "growth_factor": 2.0
+  },
+  "matrix": {
+    "stages": [0, 1, 2, 3],
+    "bandwidth_gbps": [0.0, 1.0, 2.0, 5.0, 10.0]
+  }
+}

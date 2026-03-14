@@ -4,7 +4,7 @@ Implemented stages:
 
 - `stage0_ddp.py`: full replication + gradient allreduce + local AdamW step
 - `stage1_optimizer.py`: optimizer-state sharding + gradient allreduce + parameter allgather
-- `stage2_optimizer.py`: optimizer-state sharding + gradient reduce-scatter + parameter allgather
+- `stage2_optimizer.py`: optimizer-state sharding + bucketed gradient reduce-scatter + parameter allgather
 - `stage3_optimizer.py`: module-wise ZeRO-3 with sharded parameter residency, backward recomputation, per-module allgather/reduce-scatter, and sharded optimizer state
 
 Design goals:
@@ -45,4 +45,5 @@ Test coverage:
 Note:
 
 - Stage 3 now shards parameters between module calls and rematerializes them lazily through the model forward path.
+- Stage 2 now buckets contiguous parameter ranges before `reduce_scatter`, so communication is no longer one collective per parameter tensor.
 - It is still correctness-first: no overlap/prefetch optimization yet, but parameter residency now matches the intended ZeRO-3 execution model much more closely.

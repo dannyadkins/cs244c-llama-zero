@@ -42,6 +42,9 @@ def test_parse_summary_week3_schema(tmp_path: Path) -> None:
     assert case.stage == 3
     assert case.model_size == "tiny"
     assert case.bandwidth_gbps == 5.0
+    assert case.batch_size == 0
+    assert case.grad_accum_steps == 1
+    assert case.seq_len == 0
     assert case.profile_path is None
     assert case.mean_tokens_per_s == 123.0
     assert case.mean_tflops_per_s == 0.456
@@ -76,7 +79,40 @@ def test_parse_summary_week2_compat_schema(tmp_path: Path) -> None:
     assert case.stage == 2
     assert case.model_size == "unknown"
     assert case.bandwidth_gbps == 0.0
+    assert case.batch_size == 0
+    assert case.grad_accum_steps == 1
+    assert case.seq_len == 0
     assert case.profile_path is None
+
+
+def test_parse_summary_rebases_repo_relative_paths_into_run_dir(tmp_path: Path) -> None:
+    run_dir = tmp_path / "remote_4gpu_bandwidth_smoke"
+    logs_dir = run_dir / "logs"
+    profiles_dir = run_dir / "profiles"
+    logs_dir.mkdir(parents=True)
+    profiles_dir.mkdir(parents=True)
+    log_path = logs_dir / "case.log"
+    profile_path = profiles_dir / "case.json"
+    log_path.write_text("ok\n")
+    profile_path.write_text("{}")
+
+    payload = {
+        "results": [
+            {
+                "config": {"stage": 0, "model_size": "tiny", "bandwidth_gbps": 5.0},
+                "log_path": "experiments/results/remote_4gpu_bandwidth_smoke/logs/case.log",
+                "profile_path": "experiments/results/remote_4gpu_bandwidth_smoke/profiles/case.json",
+                "return_code": 0,
+            }
+        ]
+    }
+    summary_path = run_dir / "summary.json"
+    summary_path.write_text(json.dumps(payload))
+
+    cases = visualize.parse_summary(summary_path)
+
+    assert cases[0].log_path == log_path
+    assert cases[0].profile_path == profile_path
 
 
 def test_parse_loss_log_handles_missing_file(tmp_path: Path) -> None:
@@ -91,6 +127,9 @@ def test_case_peak_memory_prefers_host_when_cuda_is_zero() -> None:
         stage=3,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=None,
         mean_tokens_per_s=None,
@@ -117,6 +156,9 @@ def test_case_peak_memory_prefers_true_cuda_peak() -> None:
         stage=0,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=None,
         mean_tokens_per_s=None,
@@ -143,6 +185,9 @@ def test_case_peak_breakdown_uses_measured_state_total() -> None:
         stage=0,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=None,
         mean_tokens_per_s=None,
@@ -183,6 +228,9 @@ def test_case_peak_breakdown_prefers_logical_state_over_live_peak_state(tmp_path
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -207,6 +255,9 @@ def test_case_peak_breakdown_prefers_logical_state_over_live_peak_state(tmp_path
 def test_representative_cases_prefer_unlimited_baseline() -> None:
     base = dict(
         model_size="tiny",
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=None,
         mean_tokens_per_s=None,
@@ -255,6 +306,9 @@ def test_case_average_live_breakdown_uses_profile_snapshots(tmp_path: Path) -> N
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -299,6 +353,9 @@ def test_case_average_live_breakdown_prefers_measured_step_state_timeline(tmp_pa
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -343,6 +400,9 @@ def test_case_average_live_breakdown_uses_timestamp_weighting(tmp_path: Path) ->
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -381,6 +441,9 @@ def test_case_peak_state_breakdown_prefers_timeline_max(tmp_path: Path) -> None:
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -428,6 +491,9 @@ def test_case_state_breakdown_at_peak_total_prefers_peak_snapshot_label(tmp_path
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -472,6 +538,9 @@ def test_case_post_backward_state_breakdown_prefers_post_backward_label(tmp_path
         stage=2,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,
@@ -527,6 +596,9 @@ def test_case_peak_breakdown_backfills_legacy_stage3_local_shards(tmp_path: Path
         stage=3,
         model_size="tiny",
         bandwidth_gbps=0.0,
+        batch_size=1,
+        grad_accum_steps=1,
+        seq_len=1,
         log_path=Path("/tmp/missing.log"),
         profile_path=profile_path,
         mean_tokens_per_s=None,

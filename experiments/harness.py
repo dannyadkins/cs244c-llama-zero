@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOCKET_SHAPER_SOURCE = PROJECT_ROOT / "infra" / "socket_shaper.c"
+SOCKET_SHAPER_SO = PROJECT_ROOT / "infra" / "socket_shaper.so"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -41,10 +43,14 @@ class CaseConfig:
     seed: int
     dtype: str
     max_grad_norm: float
+    stage2_grad_bucket_mb: float
     profile_memory_interval: int
+    metrics_warmup_steps: int
     bandwidth_mode: str
     sim_latency_ms: float
     tc_interface: str
+    socket_interface: str
+    socket_shaper_burst_bytes: int
     theory_vocab_size: int
     extra_args: str
 
@@ -85,7 +91,7 @@ class LaunchConfig:
     case_timeout_s: float
 
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Week 3 experiment harness for ZeRO stages 0-3")
     parser.add_argument("--config", type=str, default="")
 
@@ -114,12 +120,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--max-grad-norm", type=float, default=0.0)
+    parser.add_argument(
+        "--stage2-grad-bucket-mb",
+        type=float,
+        default=64.0,
+        help="Approximate fp32 gradient bucket size for ZeRO stage 2 reduce-scatter bucketing.",
+    )
 
     parser.add_argument("--profile-memory-interval", type=int, default=0)
+    parser.add_argument(
+        "--metrics-warmup-steps",
+        type=int,
+        default=0,
+        help="Ignore this many logged training steps when computing mean step metrics.",
+    )
 
-    parser.add_argument("--bandwidth-mode", type=str, default="simulated", choices=["simulated", "none", "tc"])
+    parser.add_argument("--bandwidth-mode", type=str, default="simulated", choices=["simulated", "none", "tc", "socket"])
     parser.add_argument("--sim-latency-ms", type=float, default=0.0)
     parser.add_argument("--tc-interface", type=str, default="eth0")
+    parser.add_argument("--socket-interface", type=str, default="lo")
+    parser.add_argument(
+        "--socket-shaper-burst-bytes",
+        type=int,
+        default=262_144,
+        help="Per-process socket shaper burst size in bytes for bandwidth-mode=socket.",
+    )
     parser.add_argument(
         "--theory-vocab-size",
         type=int,
@@ -128,7 +153,34 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--extra-args", type=str, default="")
-    return parser.parse_args()
+    return parser
+
+
+def _apply_config_to_parser(parser: argparse.ArgumentParser, config_path: str) -> None:
+    payload = json.loads(Path(config_path).read_text())
+    defaults = payload.get("defaults", {})
+    matrix = payload.get("matrix", {})
+
+    parser_defaults: Dict[str, object] = {}
+    if isinstance(defaults, dict):
+        parser_defaults.update(defaults)
+    if isinstance(matrix, dict):
+        if "stages" in matrix:
+            parser_defaults["stages"] = matrix["stages"]
+        if "model_sizes" in matrix:
+            parser_defaults["model_sizes"] = matrix["model_sizes"]
+        if "bandwidth_gbps" in matrix:
+            parser_defaults["bandwidth_gbps"] = matrix["bandwidth_gbps"]
+    if parser_defaults:
+        parser.set_defaults(**parser_defaults)
+
+
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = _build_parser()
+    preliminary_args, _ = parser.parse_known_args(argv)
+    if preliminary_args.config:
+        _apply_config_to_parser(parser, preliminary_args.config)
+    return parser.parse_args(argv)
 
 
 def _merge_config_file(args: argparse.Namespace) -> argparse.Namespace:
@@ -189,10 +241,14 @@ def _build_cases(args: argparse.Namespace) -> List[CaseConfig]:
                 seed=int(args.seed),
                 dtype=str(args.dtype),
                 max_grad_norm=float(args.max_grad_norm),
+                stage2_grad_bucket_mb=float(args.stage2_grad_bucket_mb),
                 profile_memory_interval=int(args.profile_memory_interval),
+                metrics_warmup_steps=int(args.metrics_warmup_steps),
                 bandwidth_mode=str(args.bandwidth_mode),
                 sim_latency_ms=float(args.sim_latency_ms),
                 tc_interface=str(args.tc_interface),
+                socket_interface=str(args.socket_interface),
+                socket_shaper_burst_bytes=int(args.socket_shaper_burst_bytes),
                 theory_vocab_size=int(args.theory_vocab_size),
                 extra_args=str(args.extra_args),
             )
@@ -244,37 +300,41 @@ def _theoretical_memory(case: CaseConfig) -> tuple[int, Dict[str, float]]:
     return num_params, breakdown
 
 
-def _parse_step_metrics(log_text: str) -> Dict[str, object]:
+def _parse_step_metrics(log_text: str, metrics_warmup_steps: int = 0) -> Dict[str, object]:
     losses: List[float] = []
-    tps: List[float] = []
-    tflops: List[float] = []
-    comm_ms: List[float] = []
-    fb_ms: List[float] = []
-    opt_ms: List[float] = []
+    step_rows: List[Dict[str, float | None]] = []
 
     for line in log_text.splitlines():
         m = STEP_RE.search(line)
         if not m:
             continue
         losses.append(float(m.group(2)))
-        tps.append(float(m.group(3).replace(",", "")))
-        if m.group(8) is not None:
-            tflops.append(float(m.group(8)))
-        fb_ms.append(float(m.group(5)))
-        comm_ms.append(float(m.group(6)))
-        opt_ms.append(float(m.group(7)))
+        step_rows.append(
+            {
+                "tokens_per_s": float(m.group(3).replace(",", "")),
+                "tflops_per_s": None if m.group(8) is None else float(m.group(8)),
+                "fb_ms": float(m.group(5)),
+                "comm_ms": float(m.group(6)),
+                "opt_ms": float(m.group(7)),
+            }
+        )
 
     def mean_or_none(xs: List[float]) -> float | None:
         return float(sum(xs) / len(xs)) if xs else None
 
+    if metrics_warmup_steps > 0:
+        step_rows = step_rows[metrics_warmup_steps:]
+
     return {
         "final_loss": losses[-1] if losses else None,
         "logged_steps": len(losses),
-        "mean_tokens_per_s": mean_or_none(tps),
-        "mean_tflops_per_s": mean_or_none(tflops),
-        "mean_comm_ms": mean_or_none(comm_ms),
-        "mean_fb_ms": mean_or_none(fb_ms),
-        "mean_opt_ms": mean_or_none(opt_ms),
+        "mean_tokens_per_s": mean_or_none([float(row["tokens_per_s"]) for row in step_rows]),
+        "mean_tflops_per_s": mean_or_none(
+            [float(row["tflops_per_s"]) for row in step_rows if row["tflops_per_s"] is not None]
+        ),
+        "mean_comm_ms": mean_or_none([float(row["comm_ms"]) for row in step_rows]),
+        "mean_fb_ms": mean_or_none([float(row["fb_ms"]) for row in step_rows]),
+        "mean_opt_ms": mean_or_none([float(row["opt_ms"]) for row in step_rows]),
     }
 
 
@@ -350,11 +410,45 @@ def _master_port_for_case(launch: LaunchConfig, case_index: int) -> int:
     return launch.master_port_base + case_index
 
 
-def _build_launch_env(case: CaseConfig) -> Dict[str, str]:
+def _ensure_socket_shaper_built() -> Path:
+    if sys.platform != "linux":
+        raise RuntimeError("bandwidth-mode=socket is only supported on Linux")
+
+    if not SOCKET_SHAPER_SO.exists() or SOCKET_SHAPER_SO.stat().st_mtime < SOCKET_SHAPER_SOURCE.stat().st_mtime:
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if cc is None:
+            raise FileNotFoundError("bandwidth-mode=socket requires 'cc' or 'gcc' to build infra/socket_shaper.so")
+        subprocess.run(
+            [
+                cc,
+                "-O2",
+                "-shared",
+                "-fPIC",
+                "-o",
+                str(SOCKET_SHAPER_SO),
+                str(SOCKET_SHAPER_SOURCE),
+                "-ldl",
+                "-pthread",
+            ],
+            check=True,
+            cwd=PROJECT_ROOT,
+        )
+    return SOCKET_SHAPER_SO
+
+
+def _build_launch_env(
+    case: CaseConfig,
+    socket_shaper_path: Path | None = None,
+    socket_shaper_shared_name: str | None = None,
+) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("ZERO_SIM_BW_GBPS", None)
     env.pop("ZERO_SIM_LATENCY_MS", None)
+    env.pop("ZERO_SOCKET_SHAPER_BW_GBPS", None)
+    env.pop("ZERO_SOCKET_SHAPER_LATENCY_MS", None)
+    env.pop("ZERO_SOCKET_SHAPER_BURST_BYTES", None)
+    env.pop("ZERO_SOCKET_SHAPER_SHARED_NAME", None)
 
     if case.bandwidth_mode == "simulated":
         if case.bandwidth_gbps > 0:
@@ -367,7 +461,35 @@ def _build_launch_env(case: CaseConfig) -> Dict[str, str]:
         else:
             env.pop("ZERO_SIM_LATENCY_MS", None)
 
+    if case.bandwidth_mode == "socket":
+        if socket_shaper_path is None:
+            raise ValueError("socket shaper path is required for bandwidth-mode=socket")
+
+        env["ZERO_SOCKET_SHAPER_BW_GBPS"] = str(case.bandwidth_gbps)
+        if case.sim_latency_ms > 0:
+            env["ZERO_SOCKET_SHAPER_LATENCY_MS"] = str(case.sim_latency_ms)
+        env["ZERO_SOCKET_SHAPER_BURST_BYTES"] = str(case.socket_shaper_burst_bytes)
+        if socket_shaper_shared_name:
+            env["ZERO_SOCKET_SHAPER_SHARED_NAME"] = socket_shaper_shared_name
+        env["NCCL_P2P_DISABLE"] = "1"
+        env["NCCL_SHM_DISABLE"] = "1"
+        env["NCCL_IB_DISABLE"] = "1"
+        env["NCCL_SOCKET_IFNAME"] = case.socket_interface
+        env["GLOO_SOCKET_IFNAME"] = case.socket_interface
+        env["NCCL_DEBUG"] = "INFO"
+        env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+
+        existing_preload = env.get("LD_PRELOAD", "").strip()
+        preload_parts = [str(socket_shaper_path)]
+        if existing_preload:
+            preload_parts.append(existing_preload)
+        env["LD_PRELOAD"] = ":".join(preload_parts)
+
     return env
+
+
+def _verify_socket_transport_log(log_text: str) -> bool:
+    return ("Using network Socket" in log_text) or ("via NET/Socket/" in log_text)
 
 
 def _build_train_zero_cmd(case: CaseConfig, profile_path: Path, launch: LaunchConfig, case_index: int) -> List[str]:
@@ -409,6 +531,8 @@ def _build_train_zero_cmd(case: CaseConfig, profile_path: Path, launch: LaunchCo
         case.dtype,
         "--max-grad-norm",
         str(case.max_grad_norm),
+        "--stage2-grad-bucket-mb",
+        str(case.stage2_grad_bucket_mb),
         "--log-interval",
         "1",
         "--checkpoint-interval",
@@ -463,7 +587,13 @@ def _run_case(
     log_path = logs_dir / f"{case_id}.log"
     profile_path = profiles_dir / f"{case_id}.json"
     cmd = _build_train_zero_cmd(case=case, profile_path=profile_path, launch=launch, case_index=case_index)
-    env = _build_launch_env(case)
+    socket_shaper_path = _ensure_socket_shaper_built() if case.bandwidth_mode == "socket" else None
+    socket_shaper_shared_name = f"zero_socket_{os.getpid()}_{case_index}"
+    env = _build_launch_env(
+        case,
+        socket_shaper_path=socket_shaper_path,
+        socket_shaper_shared_name=socket_shaper_shared_name if case.bandwidth_mode == "socket" else None,
+    )
     command_str = " ".join(shlex.quote(x) for x in cmd)
 
     if dry_run:
@@ -523,9 +653,13 @@ def _run_case(
             _clear_tc(case)
 
     elapsed_s = time.perf_counter() - t0
+    if return_code == 0 and case.bandwidth_mode == "socket" and not _verify_socket_transport_log(log_text):
+        return_code = 125
+        notes = "socket_transport_verification_failed"
+        log_text += "\n[harness] expected NCCL NET/Socket transport markers were missing from the log\n"
     log_path.write_text(log_text)
 
-    metrics = _parse_step_metrics(log_text)
+    metrics = _parse_step_metrics(log_text, metrics_warmup_steps=case.metrics_warmup_steps)
     memory_metrics = _parse_profile_memory(profile_path)
     num_params, memory_mb = _theoretical_memory(case)
 
@@ -578,7 +712,7 @@ def _build_summary(results: List[CaseResult], args: argparse.Namespace) -> Dict[
 
 
 def main() -> None:
-    args = _merge_config_file(parse_args())
+    args = parse_args()
     launch = _launch_config_from_args(args)
 
     if shutil.which("tc") is None and args.bandwidth_mode == "tc":

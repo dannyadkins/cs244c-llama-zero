@@ -122,6 +122,27 @@ def flatten_params_fp32(meta: FlatParamMetadata) -> torch.Tensor:
     return torch.cat([_flatten_tensor_fp32(p.data) for p in meta.params], dim=0)
 
 
+def flatten_param_shard_fp32(meta: FlatParamMetadata, shard_start: int, shard_end: int) -> torch.Tensor:
+    shard_numel = max(0, shard_end - shard_start)
+    if shard_numel == 0:
+        return torch.empty(0, dtype=torch.float32, device=meta.device)
+
+    shard = torch.empty(shard_numel, dtype=torch.float32, device=meta.device)
+    for p, start in zip(meta.params, meta.offsets):
+        param_end = start + p.numel()
+        overlap_start = max(start, shard_start)
+        overlap_end = min(param_end, shard_end)
+        if overlap_end <= overlap_start:
+            continue
+
+        flat = p.data.detach().view(-1)
+        src = flat[overlap_start - start : overlap_end - start]
+        if src.dtype != torch.float32:
+            src = src.to(torch.float32)
+        shard[overlap_start - shard_start : overlap_end - shard_start].copy_(src)
+    return shard
+
+
 def flatten_grads_fp32(meta: FlatParamMetadata) -> torch.Tensor:
     parts: List[torch.Tensor] = []
     for p in meta.params:

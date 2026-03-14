@@ -16,6 +16,9 @@ class CaseView:
     stage: int
     model_size: str
     bandwidth_gbps: float
+    batch_size: int
+    grad_accum_steps: int
+    seq_len: int
     log_path: Path
     profile_path: Path | None
     mean_tokens_per_s: float | None
@@ -72,6 +75,21 @@ def _result_bandwidth(result: Dict[str, object]) -> float:
     return float(config.get("bandwidth_gbps", 0.0))
 
 
+def _result_batch_size(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("batch_size", 0))
+
+
+def _result_grad_accum_steps(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("grad_accum_steps", 1))
+
+
+def _result_seq_len(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("seq_len", 0))
+
+
 def _result_log_path(result: Dict[str, object]) -> Path:
     if "log_path" in result:
         return Path(str(result["log_path"]))
@@ -87,24 +105,42 @@ def _result_profile_path(result: Dict[str, object]) -> Path | None:
     return Path(str(raw))
 
 
+def _resolve_run_path(run_dir: Path, raw_path: Path) -> Path:
+    if raw_path.is_absolute() or raw_path.exists():
+        return raw_path
+
+    if run_dir.name in raw_path.parts:
+        parts = raw_path.parts
+        idx = parts.index(run_dir.name)
+        rebased = run_dir.joinpath(*parts[idx + 1 :])
+        if rebased.exists():
+            return rebased
+
+    direct = run_dir / raw_path
+    if direct.exists():
+        return direct
+    return raw_path
+
+
 def parse_summary(summary_path: Path) -> List[CaseView]:
     summary = json.loads(summary_path.read_text())
     out: List[CaseView] = []
     run_dir = summary_path.parent
 
     for result in summary.get("results", []):
-        raw_log_path = _result_log_path(result)
-        if not raw_log_path.is_absolute() and not raw_log_path.exists():
-            raw_log_path = run_dir / raw_log_path
+        raw_log_path = _resolve_run_path(run_dir, _result_log_path(result))
         raw_profile_path = _result_profile_path(result)
-        if raw_profile_path is not None and not raw_profile_path.is_absolute() and not raw_profile_path.exists():
-            raw_profile_path = run_dir / raw_profile_path
+        if raw_profile_path is not None:
+            raw_profile_path = _resolve_run_path(run_dir, raw_profile_path)
 
         out.append(
             CaseView(
                 stage=_result_stage(result),
                 model_size=_result_model_size(result),
                 bandwidth_gbps=_result_bandwidth(result),
+                batch_size=_result_batch_size(result),
+                grad_accum_steps=_result_grad_accum_steps(result),
+                seq_len=_result_seq_len(result),
                 log_path=raw_log_path,
                 profile_path=raw_profile_path,
                 mean_tokens_per_s=_as_optional_float(result.get("mean_tokens_per_s")),

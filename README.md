@@ -33,10 +33,16 @@ For the current experiment status, runbook, and remaining execution plan, read `
 - `zero/stage3_optimizer.py`: module-wise Stage 3 parameter sharding/materialization with backward recomputation
 - `train_zero.py --zero-stage 3` integration
 - `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
-- Simulated bandwidth mode via env-driven collective delay (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
+- `experiments/run_remote_bandwidth_sweep.py`: ship the current repo to an isolated remote workspace, run a sweep, sync results back, and generate plots + a markdown report
+- `experiments/run_fit_memory_bandwidth.py`: tune the largest per-stage microbatch under one GPU-memory budget, then sweep bandwidth with those tuned workloads
+- `experiments/run_remote_fit_memory_bandwidth.py`: remote wrapper for the fit-to-memory workflow
+- Linux socket-transport bandwidth shaping via `LD_PRELOAD` + forced NCCL `NET/Socket` on loopback, using a shared token bucket across all ranks in a case
+- Legacy collective-delay simulation mode for quick debugging (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
 - Optional `tc` throttling mode integration in harness
 - Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
 - `analysis/visualize.py`: plots for throughput/communication vs bandwidth, loss curves, and measured/theoretical memory
+- `analysis/bandwidth_report.py`: markdown summary of best stage by bandwidth plus throughput/communication tables
+- `scripts/benchmark_allreduce.py`: raw allreduce throughput benchmark for validating shaped transports
 
 ## Repository Layout
 
@@ -108,7 +114,7 @@ python3 -m torch.distributed.run \
 Run a config-driven matrix:
 
 ```bash
-python3 experiments/harness.py --config experiments/configs/week3_smoke_matrix.json
+python3 experiments/harness.py --config experiments/configs/remote_4gpu_bandwidth_smoke.json
 ```
 
 Run a custom sweep directly from CLI:
@@ -119,7 +125,8 @@ python3 experiments/harness.py \
   --stages 0 1 2 3 \
   --model-sizes medium \
   --bandwidth-gbps 0 1 2.5 5 10 25 50 \
-  --bandwidth-mode simulated \
+  --bandwidth-mode socket \
+  --socket-interface lo \
   --nproc-per-node 2 \
   --steps 100
 ```
@@ -134,6 +141,36 @@ python3 experiments/harness.py \
   --bandwidth-gbps 5 10 \
   --bandwidth-mode tc \
   --tc-interface eth0
+```
+
+Run the current branch on a remote GPU machine in an isolated workspace and pull the finished run back locally:
+
+```bash
+python3 experiments/run_remote_bandwidth_sweep.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_bandwidth_socket.json \
+  --overwrite-local
+```
+
+Run the fit-to-memory experiment, which first tunes the largest per-stage microbatch under a fixed GPU-memory budget and then reruns the bandwidth sweep with those tuned microbatches:
+
+```bash
+python3 experiments/run_remote_fit_memory_bandwidth.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_fit_memory_socket.json \
+  --overwrite-local
+```
+
+Use the simulated fast config only for coarse debugging when socket shaping is unavailable:
+
+```bash
+python3 experiments/run_remote_bandwidth_sweep.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
+  --overwrite-local
 ```
 
 ## Visualization

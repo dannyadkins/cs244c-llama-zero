@@ -12,6 +12,7 @@ from model.config import ModelConfig
 from model.llama import LlamaForCausalLM
 from profiler import MemoryTracker
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
+from zero.common import build_flat_param_metadata, flatten_param_shard_fp32, flatten_params_fp32
 
 
 pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
@@ -50,6 +51,22 @@ def _assert_models_close(model_a: LlamaForCausalLM, model_b: LlamaForCausalLM, m
 
 def _full_param_context(engine):
     return engine.summon_full_params() if hasattr(engine, "summon_full_params") else nullcontext()
+
+
+def test_flatten_param_shard_matches_full_slice() -> None:
+    cfg = _test_config()
+    model = LlamaForCausalLM(cfg)
+    meta = build_flat_param_metadata(model)
+    flat = flatten_params_fp32(meta)
+
+    cases = [
+        (0, min(17, meta.total_numel)),
+        (11, min(57, meta.total_numel)),
+        (max(0, meta.total_numel - 23), meta.total_numel),
+    ]
+    for shard_start, shard_end in cases:
+        shard = flatten_param_shard_fp32(meta, shard_start=shard_start, shard_end=shard_end)
+        torch.testing.assert_close(shard, flat[shard_start:shard_end])
 
 
 def _run_stage_worker(rank: int, world_size: int, port: int, stage: int, max_grad_norm: float) -> None:
@@ -373,6 +390,75 @@ def test_stage2_releases_full_grads_and_keeps_shard_world2() -> None:
     mp.spawn(_stage2_sharded_grad_worker, args=(2, port), nprocs=2, join=True)
 
 
+def _stage2_grad_accum_worker(rank: int, world_size: int, port: int) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        cfg = _test_config()
+        torch.manual_seed(777)
+
+        model_zero = LlamaForCausalLM(cfg)
+        for param in model_zero.parameters():
+            dist.broadcast(param.data, src=0)
+
+        model_ref = LlamaForCausalLM(cfg)
+        model_ref.load_state_dict(model_zero.state_dict())
+
+        kwargs = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.01}
+        engine = ZeROStage2Optimizer(model=model_zero, grad_bucket_numel=4_096, **kwargs)
+        opt_ref = torch.optim.AdamW(model_ref.parameters(), **kwargs)
+
+        batch_size = 3
+        grad_accum_steps = 2
+        for step in range(2):
+            engine.zero_grad()
+            ref_losses = []
+            for micro_idx in range(grad_accum_steps):
+                local_ids = _local_batch(
+                    step=(step * grad_accum_steps) + micro_idx,
+                    rank=rank,
+                    batch_size=batch_size,
+                    seq_len=cfg.max_seq_len,
+                    vocab_size=cfg.vocab_size,
+                )
+                gathered = [torch.empty_like(local_ids) for _ in range(world_size)]
+                dist.all_gather(gathered, local_ids)
+                global_ids = torch.cat(gathered, dim=0)
+
+                loss_zero = model_zero(input_ids=local_ids, labels=local_ids).loss
+                assert loss_zero is not None
+                engine.backward(loss_zero / grad_accum_steps)
+
+                ref_losses.append(global_ids)
+
+            engine.step(max_grad_norm=0.25)
+
+            opt_ref.zero_grad(set_to_none=True)
+            total_ref_loss = torch.zeros((), dtype=torch.float32)
+            for global_ids in ref_losses:
+                loss_ref = model_ref(input_ids=global_ids, labels=global_ids).loss
+                assert loss_ref is not None
+                total_ref_loss = total_ref_loss + (loss_ref / grad_accum_steps)
+            total_ref_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model_ref.parameters(), max_norm=0.25)
+            opt_ref.step()
+
+            _assert_models_close(model_zero, model_ref, msg=f"stage2 grad_accum step={step} rank={rank}")
+    finally:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def test_stage2_matches_reference_with_grad_accum_world2() -> None:
+    port = _find_free_port()
+    mp.spawn(_stage2_grad_accum_worker, args=(2, port), nprocs=2, join=True)
+
+
 def test_stage2_memory_trace_records_internal_labels_world1() -> None:
     cfg = _test_config()
     model = LlamaForCausalLM(cfg)
@@ -383,6 +469,7 @@ def test_stage2_memory_trace_records_internal_labels_world1() -> None:
         betas=(0.9, 0.95),
         eps=1e-8,
         weight_decay=0.0,
+        grad_bucket_numel=4_096,
         memory_tracker=MemoryTracker(device=None),
         memory_trace_active=True,
         memory_state_timeline=timeline,
@@ -403,6 +490,8 @@ def test_stage2_memory_trace_records_internal_labels_world1() -> None:
     post_free_labels = [label for label in labels if label.endswith("_post_free")]
 
     assert ready_labels
+    assert 1 < len(engine._grad_buckets) < len(engine.meta.params)
+    assert len(ready_labels) == len(engine._grad_buckets)
     assert len(ready_labels) == len(pre_labels) == len(post_reduce_labels) == len(post_free_labels)
     assert labels[-3:] == [
         "measured_step_stage2_pre_allgather",

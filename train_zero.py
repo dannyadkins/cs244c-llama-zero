@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--max-grad-norm", type=float, default=0.0)
+    parser.add_argument(
+        "--stage2-grad-bucket-mb",
+        type=float,
+        default=64.0,
+        help="Approximate fp32 gradient bucket size for ZeRO stage 2 reduce-scatter bucketing.",
+    )
 
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--seed", type=int, default=1337)
@@ -180,7 +186,8 @@ def build_engine(args: argparse.Namespace, model: LlamaForCausalLM, collectives)
     if args.zero_stage == 1:
         return ZeROStage1Optimizer(**kwargs)
     if args.zero_stage == 2:
-        return ZeROStage2Optimizer(**kwargs)
+        grad_bucket_numel = max(1, int((args.stage2_grad_bucket_mb * 1024.0 * 1024.0) / 4.0))
+        return ZeROStage2Optimizer(**kwargs, grad_bucket_numel=grad_bucket_numel)
     if args.zero_stage == 3:
         return ZeROStage3Optimizer(**kwargs)
     raise ValueError(f"Unsupported stage: {args.zero_stage}")
@@ -576,6 +583,34 @@ def train(args: argparse.Namespace) -> None:
                     "communication_ms": comm_ms,
                     "optimizer_ms": float(step_stats["optim_ms"]),
                     "iteration_ms": iter_ms,
+                    "communication_backward_reduce_scatter_ms": float(
+                        step_stats.get("communication_backward_reduce_scatter_ms", 0.0)
+                    ),
+                    "communication_backward_reduce_scatter_calls": float(
+                        step_stats.get("communication_backward_reduce_scatter_calls", 0.0)
+                    ),
+                    "communication_backward_reduce_scatter_bytes": float(
+                        step_stats.get("communication_backward_reduce_scatter_bytes", 0.0)
+                    ),
+                    "communication_post_allgather_ms": float(step_stats.get("communication_post_allgather_ms", 0.0)),
+                    "communication_post_allgather_calls": float(step_stats.get("communication_post_allgather_calls", 0.0)),
+                    "communication_post_allgather_bytes": float(step_stats.get("communication_post_allgather_bytes", 0.0)),
+                    "communication_forward_allgather_ms": float(step_stats.get("communication_forward_allgather_ms", 0.0)),
+                    "communication_forward_allgather_calls": float(
+                        step_stats.get("communication_forward_allgather_calls", 0.0)
+                    ),
+                    "communication_forward_allgather_bytes": float(
+                        step_stats.get("communication_forward_allgather_bytes", 0.0)
+                    ),
+                    "communication_backward_allgather_ms": float(
+                        step_stats.get("communication_backward_allgather_ms", 0.0)
+                    ),
+                    "communication_backward_allgather_calls": float(
+                        step_stats.get("communication_backward_allgather_calls", 0.0)
+                    ),
+                    "communication_backward_allgather_bytes": float(
+                        step_stats.get("communication_backward_allgather_bytes", 0.0)
+                    ),
                     "overlap_ratio": overlap_ratio,
                 }
             )

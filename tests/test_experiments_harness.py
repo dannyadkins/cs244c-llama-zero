@@ -34,10 +34,14 @@ def _base_args() -> argparse.Namespace:
         seed=1337,
         dtype="float32",
         max_grad_norm=0.0,
+        stage2_grad_bucket_mb=64.0,
         profile_memory_interval=0,
+        metrics_warmup_steps=0,
         bandwidth_mode="simulated",
         sim_latency_ms=0.0,
         tc_interface="eth0",
+        socket_interface="lo",
+        socket_shaper_burst_bytes=262_144,
         theory_vocab_size=0,
         extra_args="",
     )
@@ -70,6 +74,26 @@ def test_parse_step_metrics_extracts_means() -> None:
     assert metrics["mean_fb_ms"] == 15.0
     assert metrics["mean_comm_ms"] == 10.0
     assert metrics["mean_opt_ms"] == 3.0
+
+
+def test_parse_step_metrics_can_skip_warmup_steps() -> None:
+    log_text = "\n".join(
+        [
+            "[step 00001] loss=8.3000 avg100=8.3000 tokens/s=300 grad_norm=0.900 fb_ms=30.0 comm_ms=10.0 opt_ms=3.0 tflops=0.100",
+            "[step 00002] loss=8.1000 avg100=8.2000 tokens/s=900 grad_norm=1.100 fb_ms=12.0 comm_ms=4.0 opt_ms=2.0 tflops=0.400",
+            "[step 00003] loss=8.0000 avg100=8.1333 tokens/s=1,200 grad_norm=1.000 fb_ms=9.0 comm_ms=3.0 opt_ms=1.0 tflops=0.500",
+        ]
+    )
+
+    metrics = harness._parse_step_metrics(log_text, metrics_warmup_steps=1)
+
+    assert metrics["final_loss"] == 8.0
+    assert metrics["logged_steps"] == 3
+    assert metrics["mean_tokens_per_s"] == 1050.0
+    assert metrics["mean_tflops_per_s"] == 0.45
+    assert metrics["mean_fb_ms"] == 10.5
+    assert metrics["mean_comm_ms"] == 3.5
+    assert metrics["mean_opt_ms"] == 1.5
 
 
 def test_parse_profile_memory_extracts_peaks(tmp_path: Path) -> None:
@@ -177,6 +201,47 @@ def test_merge_config_file_overrides_defaults_and_matrix(tmp_path: Path) -> None
     assert merged.bandwidth_gbps == [0.0, 1.0]
 
 
+def test_parse_args_uses_config_as_defaults_but_preserves_explicit_cli(tmp_path: Path) -> None:
+    cfg = {
+        "defaults": {
+            "name": "from_config",
+            "steps": 99,
+            "seq_len": 256,
+            "batch_size": 2,
+            "dtype": "bfloat16",
+        },
+        "matrix": {
+            "stages": [0, 1, 2, 3],
+            "model_sizes": ["medium"],
+            "bandwidth_gbps": [0.0, 1.0],
+        },
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    parsed = harness.parse_args(
+        [
+            "--config",
+            str(cfg_path),
+            "--name",
+            "from_cli",
+            "--steps",
+            "5",
+            "--bandwidth-gbps",
+            "5.0",
+        ]
+    )
+
+    assert parsed.name == "from_cli"
+    assert parsed.steps == 5
+    assert parsed.seq_len == 256
+    assert parsed.batch_size == 2
+    assert parsed.dtype == "bfloat16"
+    assert parsed.stages == [0, 1, 2, 3]
+    assert parsed.model_sizes == ["medium"]
+    assert parsed.bandwidth_gbps == [5.0]
+
+
 def test_theoretical_memory_monotonic_for_stages() -> None:
     args = _base_args()
     args.stages = [0, 1, 2, 3]
@@ -209,6 +274,8 @@ def test_build_train_zero_cmd_uses_active_python_and_explicit_master() -> None:
     assert cmd[cmd.index("--master_addr") + 1] == "127.0.0.1"
     assert "--master_port" in cmd
     assert cmd[cmd.index("--master_port") + 1] == "29503"
+    assert "--stage2-grad-bucket-mb" in cmd
+    assert cmd[cmd.index("--stage2-grad-bucket-mb") + 1] == "64.0"
     assert str(harness.PROJECT_ROOT / "train_zero.py") in cmd
 
 
@@ -228,6 +295,36 @@ def test_build_launch_env_sets_simulated_bandwidth(monkeypatch) -> None:
     env = harness._build_launch_env(case)
     assert "ZERO_SIM_BW_GBPS" not in env
     assert "ZERO_SIM_LATENCY_MS" not in env
+
+
+def test_build_launch_env_sets_socket_shaper_and_nccl_socket_transport() -> None:
+    args = _base_args()
+    case = harness._build_cases(args)[-1]
+    case.bandwidth_mode = "socket"
+    case.sim_latency_ms = 2.5
+
+    env = harness._build_launch_env(
+        case,
+        socket_shaper_path=Path("/tmp/socket_shaper.so"),
+        socket_shaper_shared_name="zero_socket_unit",
+    )
+
+    assert env["ZERO_SOCKET_SHAPER_BW_GBPS"] == "5.0"
+    assert env["ZERO_SOCKET_SHAPER_LATENCY_MS"] == "2.5"
+    assert env["ZERO_SOCKET_SHAPER_BURST_BYTES"] == "262144"
+    assert env["ZERO_SOCKET_SHAPER_SHARED_NAME"] == "zero_socket_unit"
+    assert env["NCCL_P2P_DISABLE"] == "1"
+    assert env["NCCL_SHM_DISABLE"] == "1"
+    assert env["NCCL_IB_DISABLE"] == "1"
+    assert env["NCCL_SOCKET_IFNAME"] == "lo"
+    assert env["GLOO_SOCKET_IFNAME"] == "lo"
+    assert env["LD_PRELOAD"] == "/tmp/socket_shaper.so"
+
+
+def test_verify_socket_transport_log_detects_nccl_socket_markers() -> None:
+    assert harness._verify_socket_transport_log("NCCL INFO Using network Socket")
+    assert harness._verify_socket_transport_log("Channel 00/0 : 0[0] -> 1[1] [send] via NET/Socket/0")
+    assert not harness._verify_socket_transport_log("NCCL INFO Using network IB")
 
 
 def test_run_case_timeout_records_failure(tmp_path: Path, monkeypatch) -> None:

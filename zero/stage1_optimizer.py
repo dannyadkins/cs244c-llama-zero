@@ -16,8 +16,8 @@ from .common import (
     build_flat_param_metadata,
     bytes_to_mb,
     compute_shard_spec,
+    flatten_param_shard_fp32,
     flatten_grads_fp32,
-    flatten_params_fp32,
     get_rank_world_size,
     grads_num_bytes,
     params_num_bytes,
@@ -99,28 +99,33 @@ class ZeROStage1Optimizer:
 
     def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
         t0 = time.perf_counter()
-        flat_params = flatten_params_fp32(self.meta)
         flat_grads = flatten_grads_fp32(self.meta)
 
         self._record_memory_event("measured_step_stage1_pre_allreduce")
         t_comm0 = time.perf_counter()
-        synced_grads = self.collectives.allreduce(flat_grads, average=True)
+        synced_grads = self.collectives.allreduce_inplace(flat_grads, average=True)
         comm_ms = (time.perf_counter() - t_comm0) * 1000.0
         self._record_memory_event("measured_step_stage1_post_allreduce")
         grad_norm = self._clip_flat_grads_inplace(synced_grads, max_grad_norm=max_grad_norm)
 
-        local_params = flat_params[self.shard.shard_start : self.shard.shard_end].clone()
-        local_grads = synced_grads[self.shard.shard_start : self.shard.shard_end].clone()
+        local_params = flatten_param_shard_fp32(self.meta, self.shard.shard_start, self.shard.shard_end)
+        local_grads = synced_grads[self.shard.shard_start : self.shard.shard_end]
 
         t_opt0 = time.perf_counter()
         updated_local = self._adamw_update(local_params=local_params, local_grads=local_grads)
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
+        del local_params
+        del local_grads
+        del synced_grads
+        del flat_grads
 
         self._record_memory_event("measured_step_stage1_pre_allgather")
         t_comm1 = time.perf_counter()
         full_updated = self.collectives.allgather(updated_local)
         comm_ms += (time.perf_counter() - t_comm1) * 1000.0
+        del updated_local
         assign_flat_params(self.meta, full_updated[: self.meta.total_numel])
+        del full_updated
         self._record_memory_event("measured_step_stage1_post_allgather")
 
         total_ms = (time.perf_counter() - t0) * 1000.0

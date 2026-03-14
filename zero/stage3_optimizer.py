@@ -137,7 +137,8 @@ class _ShardedModuleFunction(torch.autograd.Function):
             ctx.autocast_dtype = torch.float32
 
         runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_forward")
-        runner.engine._record_forward_comm_ms(runner.handle.materialize())
+        forward_ms = runner.handle.materialize()
+        runner.engine._record_forward_allgather_ms(forward_ms, num_bytes=runner.handle.meta.total_numel * 4)
         runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_forward")
         with torch.no_grad():
             output = runner.module(*args)
@@ -167,7 +168,9 @@ class _ShardedModuleFunction(torch.autograd.Function):
                 torch.cuda.set_rng_state(ctx.cuda_rng_state, device=devices[0])
 
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_backward")
-            comm_ms = runner.handle.materialize()
+            backward_allgather_ms = runner.handle.materialize()
+            runner.engine._record_backward_allgather_ms(backward_allgather_ms, num_bytes=runner.handle.meta.total_numel * 4)
+            comm_ms = backward_allgather_ms
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_backward")
 
             with torch.enable_grad():
@@ -206,7 +209,9 @@ class _ShardedModuleFunction(torch.autograd.Function):
             input_grads = grads[: len(grad_inputs)]
             param_grads = grads[len(grad_inputs) :]
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_layer_backward")
-            comm_ms += runner.handle.accumulate_grad_shard(param_grads)
+            rs_ms = runner.handle.accumulate_grad_shard(param_grads)
+            runner.engine._record_backward_reduce_scatter_ms(rs_ms, num_bytes=runner.handle.meta.total_numel * 4)
+            comm_ms += rs_ms
             runner.handle.reshard()
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_reduce_scatter_discard")
 
@@ -270,6 +275,15 @@ class ZeROStage3Optimizer:
         self.step_count = 0
         self._forward_comm_ms = 0.0
         self._backward_comm_ms = 0.0
+        self._forward_allgather_ms = 0.0
+        self._backward_allgather_ms = 0.0
+        self._backward_reduce_scatter_ms = 0.0
+        self._forward_allgather_calls = 0
+        self._backward_allgather_calls = 0
+        self._backward_reduce_scatter_calls = 0
+        self._forward_allgather_bytes = 0
+        self._backward_allgather_bytes = 0
+        self._backward_reduce_scatter_bytes = 0
         self._summon_depth = 0
 
         self.handles: Dict[str, _Stage3ParamHandle] = {}
@@ -325,9 +339,31 @@ class ZeROStage3Optimizer:
         return runner.call(*args)
 
     def _record_forward_comm_ms(self, value: float) -> None:
-        self._forward_comm_ms += value
+        self._record_forward_allgather_ms(value=value)
 
     def _record_backward_comm_ms(self, value: float) -> None:
+        # Backward communication timing is now tracked as phase detail in:
+        #   - _backward_allgather_ms
+        #   - _backward_reduce_scatter_ms
+        # Keep this method as a no-op compatibility shim.
+        del value
+
+    def _record_forward_allgather_ms(self, value: float, num_bytes: int = 0) -> None:
+        self._forward_allgather_ms += value
+        self._forward_allgather_calls += 1
+        self._forward_allgather_bytes += int(num_bytes)
+        self._forward_comm_ms += value
+
+    def _record_backward_allgather_ms(self, value: float, num_bytes: int = 0) -> None:
+        self._backward_allgather_ms += value
+        self._backward_allgather_calls += 1
+        self._backward_allgather_bytes += int(num_bytes)
+        self._backward_comm_ms += value
+
+    def _record_backward_reduce_scatter_ms(self, value: float, num_bytes: int = 0) -> None:
+        self._backward_reduce_scatter_ms += value
+        self._backward_reduce_scatter_calls += 1
+        self._backward_reduce_scatter_bytes += int(num_bytes)
         self._backward_comm_ms += value
 
     def _record_memory_event(self, label: str) -> None:
@@ -368,6 +404,15 @@ class ZeROStage3Optimizer:
     def zero_grad(self) -> None:
         self._forward_comm_ms = 0.0
         self._backward_comm_ms = 0.0
+        self._forward_allgather_ms = 0.0
+        self._backward_allgather_ms = 0.0
+        self._backward_reduce_scatter_ms = 0.0
+        self._forward_allgather_calls = 0
+        self._backward_allgather_calls = 0
+        self._backward_reduce_scatter_calls = 0
+        self._forward_allgather_bytes = 0
+        self._backward_allgather_bytes = 0
+        self._backward_reduce_scatter_bytes = 0
         for handle in self._handle_order:
             handle.reset_grad()
         for param in self.model.parameters():
@@ -423,6 +468,15 @@ class ZeROStage3Optimizer:
         return {
             "grad_norm": grad_norm,
             "comm_ms": self._forward_comm_ms + self._backward_comm_ms,
+            "communication_forward_allgather_ms": self._forward_allgather_ms,
+            "communication_forward_allgather_calls": float(self._forward_allgather_calls),
+            "communication_forward_allgather_bytes": float(self._forward_allgather_bytes),
+            "communication_backward_allgather_ms": self._backward_allgather_ms,
+            "communication_backward_allgather_calls": float(self._backward_allgather_calls),
+            "communication_backward_allgather_bytes": float(self._backward_allgather_bytes),
+            "communication_backward_reduce_scatter_ms": self._backward_reduce_scatter_ms,
+            "communication_backward_reduce_scatter_calls": float(self._backward_reduce_scatter_calls),
+            "communication_backward_reduce_scatter_bytes": float(self._backward_reduce_scatter_bytes),
             "optim_ms": optim_ms,
             "total_ms": total_ms,
         }
