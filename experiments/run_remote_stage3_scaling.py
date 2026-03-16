@@ -16,6 +16,12 @@ from typing import List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "experiments" / "configs" / "remote_16gpu_medium_stage3_scaling.json"
+EXCLUDED_BUNDLE_PREFIXES = (
+    "experiments/results/",
+    "__pycache__/",
+    ".pytest_cache/",
+)
+EXCLUDED_BUNDLE_NAMES = {".DS_Store"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,6 +125,15 @@ def _load_config_defaults(config_path: Path) -> dict[str, object]:
 def _create_bundle() -> Path:
     proc = _run_local(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"])
     rel_paths = [item for item in proc.stdout.split("\0") if item]
+    filtered_paths = []
+    for rel_path in rel_paths:
+        normalized = rel_path.replace("\\", "/")
+        if normalized in EXCLUDED_BUNDLE_NAMES:
+            continue
+        if any(normalized.startswith(prefix) for prefix in EXCLUDED_BUNDLE_PREFIXES):
+            continue
+        filtered_paths.append(rel_path)
+    rel_paths = filtered_paths
     if not rel_paths:
         raise RuntimeError("bundle would be empty")
 
@@ -254,6 +269,8 @@ def main() -> None:
         )
 
         remote_cmd = [
+            "env",
+            "PYTHONUNBUFFERED=1",
             args.remote_python,
             "experiments/run_stage3_scaling_sweep.py",
             "--config",

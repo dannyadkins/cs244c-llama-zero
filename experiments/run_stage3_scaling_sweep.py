@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from statistics import median
+from typing import Dict, List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,6 +18,7 @@ from experiments import harness
 from experiments.run_fit_memory_bandwidth import (
     TuningTrial,
     _detect_gpu_total_memory_mb,
+    _round_down_to_multiple,
     _select_max_batch_size,
     _training_extra_args,
     _trial_from_result,
@@ -60,6 +63,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--fit-mode", type=str, default="oom_boundary", choices=["oom_boundary"])
     parser.add_argument(
+        "--tuning-strategy",
+        type=str,
+        default="predictive",
+        choices=["predictive", "exponential"],
+        help="How to seed the per-GPU memory-fit search. 'predictive' uses prior Stage 3 fits to guess the next microbatch.",
+    )
+    parser.add_argument(
         "--memory-metric",
         type=str,
         default="peak_cuda_max_allocated_mb",
@@ -72,7 +82,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-batch-size", type=int, default=1)
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--initial-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--initial-batch-size",
+        type=int,
+        default=0,
+        help="Initial microbatch guess for the first GPU count. 0 uses the midpoint of the search interval.",
+    )
     parser.add_argument("--batch-size-multiple", type=int, default=1)
     parser.add_argument("--growth-factor", type=float, default=2.0)
     parser.add_argument("--tuning-memory-warmup-steps", type=int, default=2)
@@ -207,6 +222,180 @@ def _summary_row(
     }
 
 
+def _fit_line(points: List[Tuple[float, float]]) -> tuple[float, float] | None:
+    if len(points) < 2:
+        return None
+    mean_x = sum(x for x, _ in points) / float(len(points))
+    mean_y = sum(y for _, y in points) / float(len(points))
+    denom = sum((x - mean_x) ** 2 for x, _ in points)
+    if denom <= 0.0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / denom
+    intercept = mean_y - (slope * mean_x)
+    return slope, intercept
+
+
+def _successful_memory_trials(trials: List[TuningTrial]) -> List[TuningTrial]:
+    return [trial for trial in trials if trial.fits and trial.peak_memory_mb is not None]
+
+
+def _activation_slope_mb_per_sample(trial_history_by_gpu_count: Dict[int, List[TuningTrial]]) -> float | None:
+    slopes: List[float] = []
+    for trials in trial_history_by_gpu_count.values():
+        point_by_batch: Dict[int, float] = {}
+        for trial in _successful_memory_trials(trials):
+            point_by_batch[int(trial.batch_size)] = float(trial.peak_memory_mb)
+        line = _fit_line([(float(batch_size), peak_mb) for batch_size, peak_mb in sorted(point_by_batch.items())])
+        if line is None:
+            continue
+        slope, _ = line
+        if slope > 0.0:
+            slopes.append(float(slope))
+    if not slopes:
+        return None
+    return float(median(slopes))
+
+
+def _constant_memory_by_gpu_count(
+    trial_history_by_gpu_count: Dict[int, List[TuningTrial]],
+    *,
+    activation_slope_mb_per_sample: float,
+) -> Dict[int, float]:
+    constants: Dict[int, float] = {}
+    for gpu_count, trials in trial_history_by_gpu_count.items():
+        values: List[float] = []
+        for trial in _successful_memory_trials(trials):
+            values.append(float(trial.peak_memory_mb) - (activation_slope_mb_per_sample * float(trial.batch_size)))
+        if values:
+            constants[int(gpu_count)] = float(sum(values) / float(len(values)))
+    return constants
+
+
+def _predict_from_memory_model(
+    *,
+    gpu_count: int,
+    batch_size_multiple: int,
+    min_batch_size: int,
+    max_batch_size: int,
+    previous_selected_batch_size: int | None,
+    previous_gpu_count: int | None,
+    selected_trials_by_gpu_count: Dict[int, TuningTrial],
+    trial_history_by_gpu_count: Dict[int, List[TuningTrial]],
+) -> tuple[int | None, Dict[str, object]]:
+    slope_mb_per_sample = _activation_slope_mb_per_sample(trial_history_by_gpu_count)
+    if slope_mb_per_sample is None or slope_mb_per_sample <= 0.0:
+        return None, {"kind": "insufficient_memory_slope"}
+
+    constant_by_gpu_count = _constant_memory_by_gpu_count(
+        trial_history_by_gpu_count,
+        activation_slope_mb_per_sample=slope_mb_per_sample,
+    )
+    if not constant_by_gpu_count:
+        return None, {"kind": "insufficient_constant_terms", "activation_slope_mb_per_sample": slope_mb_per_sample}
+
+    successful_selected = [
+        trial
+        for trial in selected_trials_by_gpu_count.values()
+        if trial.fits and trial.peak_memory_mb is not None and int(trial.batch_size) > 0
+    ]
+    if not successful_selected:
+        return None, {"kind": "insufficient_budget", "activation_slope_mb_per_sample": slope_mb_per_sample}
+
+    budget_mb = max(float(trial.peak_memory_mb) for trial in successful_selected)
+    constant_prediction_mb: float
+    if len(constant_by_gpu_count) >= 2:
+        line = _fit_line([(1.0 / float(count), value) for count, value in sorted(constant_by_gpu_count.items())])
+        if line is None:
+            return None, {"kind": "degenerate_constant_fit", "activation_slope_mb_per_sample": slope_mb_per_sample}
+        shard_slope_mb, intercept_mb = line
+        constant_prediction_mb = float(intercept_mb + (shard_slope_mb * (1.0 / float(gpu_count))))
+        predictor_kind = "memory_model"
+    else:
+        only_gpu_count, only_constant_mb = next(iter(sorted(constant_by_gpu_count.items())))
+        constant_prediction_mb = float(only_constant_mb) * (float(only_gpu_count) / float(gpu_count))
+        predictor_kind = "single_point_shard_scale"
+
+    available_for_batch_mb = budget_mb - constant_prediction_mb
+    if available_for_batch_mb <= 0.0:
+        return None, {
+            "kind": "non_positive_available_memory",
+            "activation_slope_mb_per_sample": slope_mb_per_sample,
+            "budget_mb": budget_mb,
+            "constant_prediction_mb": constant_prediction_mb,
+        }
+
+    raw_prediction = int(math.floor(available_for_batch_mb / slope_mb_per_sample))
+    rounded = max(min_batch_size, _round_down_to_multiple(raw_prediction, batch_size_multiple))
+    if previous_selected_batch_size is not None:
+        rounded = max(int(previous_selected_batch_size), rounded)
+    rounded = min(max_batch_size, rounded)
+    if rounded < min_batch_size:
+        rounded = min_batch_size
+    return rounded, {
+        "kind": predictor_kind,
+        "activation_slope_mb_per_sample": slope_mb_per_sample,
+        "constant_by_gpu_count_mb": {str(k): v for k, v in sorted(constant_by_gpu_count.items())},
+        "budget_mb": budget_mb,
+        "constant_prediction_mb": constant_prediction_mb,
+        "raw_prediction": raw_prediction,
+        "previous_selected_batch_size": previous_selected_batch_size,
+        "previous_gpu_count": previous_gpu_count,
+    }
+
+
+def _predict_initial_batch_size(
+    args: argparse.Namespace,
+    *,
+    gpu_count: int,
+    previous_selected_batch_size: int | None,
+    previous_gpu_count: int | None,
+    selected_trials_by_gpu_count: Dict[int, TuningTrial],
+    trial_history_by_gpu_count: Dict[int, List[TuningTrial]],
+) -> tuple[int, Dict[str, object]]:
+    min_batch_size = int(args.min_batch_size)
+    max_batch_size = int(args.max_batch_size)
+    batch_size_multiple = int(args.batch_size_multiple)
+
+    if str(args.tuning_strategy) == "predictive":
+        payload: Dict[str, object] = {"kind": "insufficient_history_for_memory_model"}
+        if len(selected_trials_by_gpu_count) >= 2 and len(trial_history_by_gpu_count) >= 2:
+            predicted, payload = _predict_from_memory_model(
+                gpu_count=gpu_count,
+                batch_size_multiple=batch_size_multiple,
+                min_batch_size=min_batch_size,
+                max_batch_size=max_batch_size,
+                previous_selected_batch_size=previous_selected_batch_size,
+                previous_gpu_count=previous_gpu_count,
+                selected_trials_by_gpu_count=selected_trials_by_gpu_count,
+                trial_history_by_gpu_count=trial_history_by_gpu_count,
+            )
+            if predicted is not None:
+                return predicted, payload
+
+        if previous_selected_batch_size is not None and previous_gpu_count is not None and previous_gpu_count > 0:
+            shard_scaled = int(
+                math.floor(float(previous_selected_batch_size) * (float(gpu_count) / float(previous_gpu_count)))
+            )
+            shard_scaled = max(previous_selected_batch_size, shard_scaled)
+            shard_scaled = _round_down_to_multiple(shard_scaled, batch_size_multiple)
+            shard_scaled = max(min_batch_size, min(max_batch_size, shard_scaled))
+            payload = dict(payload)
+            payload.update(
+                {
+                    "kind": "shard_ratio",
+                    "raw_prediction": shard_scaled,
+                    "previous_selected_batch_size": previous_selected_batch_size,
+                    "previous_gpu_count": previous_gpu_count,
+                }
+            )
+            return shard_scaled, payload
+
+    initial_guess = int(args.initial_batch_size)
+    if previous_selected_batch_size is not None:
+        initial_guess = max(initial_guess, int(previous_selected_batch_size))
+    return initial_guess, {"kind": "configured_initial_guess", "raw_prediction": initial_guess}
+
+
 def main() -> None:
     args = parse_args()
     gpu_counts = _normalized_gpu_counts(list(args.gpu_counts))
@@ -226,6 +415,9 @@ def main() -> None:
     benchmark_results: List[harness.CaseResult] = []
     scaling_points: List[Dict[str, object]] = []
     previous_selected_batch_size: int | None = None
+    previous_gpu_count: int | None = None
+    selected_trials_by_gpu_count: Dict[int, TuningTrial] = {}
+    trial_history_by_gpu_count: Dict[int, List[TuningTrial]] = {}
 
     for gpu_count in gpu_counts:
         if int(args.fixed_batch_size) > 0:
@@ -280,9 +472,14 @@ def main() -> None:
                 )
             continue
 
-        initial_batch_size = int(args.initial_batch_size)
-        if previous_selected_batch_size is not None:
-            initial_batch_size = max(initial_batch_size, previous_selected_batch_size)
+        initial_batch_size, tuning_prediction = _predict_initial_batch_size(
+            args,
+            gpu_count=gpu_count,
+            previous_selected_batch_size=previous_selected_batch_size,
+            previous_gpu_count=previous_gpu_count,
+            selected_trials_by_gpu_count=selected_trials_by_gpu_count,
+            trial_history_by_gpu_count=trial_history_by_gpu_count,
+        )
 
         def evaluate(batch_size: int) -> TuningTrial:
             tuning_case = _make_case(
@@ -308,7 +505,11 @@ def main() -> None:
                 memory_budget_mb=None,
             )
 
-        print(f"[stage3-scaling] tuning gpu_count={gpu_count}", flush=True)
+        print(
+            f"[stage3-scaling] tuning gpu_count={gpu_count} initial_batch_size={initial_batch_size} "
+            f"predictor={tuning_prediction.get('kind', 'unknown')}",
+            flush=True,
+        )
         try:
             best_trial, trials = _select_max_batch_size(
                 min_batch_size=int(args.min_batch_size),
@@ -323,6 +524,9 @@ def main() -> None:
                 "gpu_count": int(gpu_count),
                 "fit_status": "no_fit",
                 "reason": str(exc),
+                "tuning_strategy": str(args.tuning_strategy),
+                "initial_batch_size": int(initial_batch_size),
+                "tuning_prediction": tuning_prediction,
                 "selected_batch_size": None,
                 "benchmark_result": None,
                 "tuning_trials": [],
@@ -331,10 +535,16 @@ def main() -> None:
             continue
 
         previous_selected_batch_size = int(best_trial.batch_size)
+        previous_gpu_count = int(gpu_count)
+        selected_trials_by_gpu_count[int(gpu_count)] = best_trial
+        trial_history_by_gpu_count[int(gpu_count)] = list(trials)
         tuning_payload = {
             "gpu_count": int(gpu_count),
             "fit_status": "fit",
             "reason": str(best_trial.reason),
+            "tuning_strategy": str(args.tuning_strategy),
+            "initial_batch_size": int(initial_batch_size),
+            "tuning_prediction": tuning_prediction,
             "selected_batch_size": int(best_trial.batch_size),
             "selected_peak_memory_mb": None
             if best_trial.peak_memory_mb is None
@@ -413,6 +623,7 @@ def main() -> None:
         summary["methodology_note"] = (
             "This run adapts ZeRO Figure 3 to a single-host GPU-count sweep. For each GPU count, "
             "ZeRO Stage 3 is tuned to the largest per-GPU microbatch that fits at the OOM boundary, "
+            f"using the '{args.tuning_strategy}' search seeding strategy, "
             "then benchmarked without artificial bandwidth shaping."
         )
     summary["figure3_reference_note"] = (
@@ -421,6 +632,7 @@ def main() -> None:
     )
     summary["scaling_mode"] = scaling_mode
     summary["fixed_batch_size"] = None if int(args.fixed_batch_size) <= 0 else int(args.fixed_batch_size)
+    summary["tuning_strategy"] = str(args.tuning_strategy)
     summary["gpu_counts"] = gpu_counts
     summary["per_gpu_total_memory_mb"] = float(per_gpu_total_memory_mb)
     summary["per_gpu_count"] = per_gpu_count

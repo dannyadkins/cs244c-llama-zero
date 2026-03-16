@@ -45,6 +45,9 @@ def scaling_points(summary: Dict[str, object]) -> List[Dict[str, object]]:
             {
                 "gpu_count": int(raw["gpu_count"]),
                 "selected_batch_size": None if raw.get("selected_batch_size") is None else int(raw["selected_batch_size"]),
+                "selected_peak_memory_mb": None
+                if raw.get("selected_peak_memory_mb") is None
+                else float(raw["selected_peak_memory_mb"]),
                 "global_tokens_per_step": None
                 if raw.get("global_tokens_per_step") is None
                 else int(raw["global_tokens_per_step"]),
@@ -64,6 +67,13 @@ def scaling_points(summary: Dict[str, object]) -> List[Dict[str, object]]:
                 "peak_cuda_max_allocated_mb": None
                 if raw.get("peak_cuda_max_allocated_mb") is None
                 else float(raw["peak_cuda_max_allocated_mb"]),
+                "peak_memory_mb": None
+                if raw.get("selected_peak_memory_mb") is None and raw.get("peak_cuda_max_allocated_mb") is None
+                else float(
+                    raw["selected_peak_memory_mb"]
+                    if raw.get("selected_peak_memory_mb") is not None
+                    else raw["peak_cuda_max_allocated_mb"]
+                ),
             }
         )
     out.sort(key=lambda item: item["gpu_count"])
@@ -217,7 +227,7 @@ def render_report(summary: Dict[str, object], points: List[Dict[str, object]], b
                     _format_float(point["perfect_linear_tflops_per_s"]),
                     _format_float(point["speedup_vs_base"]),
                     _format_float(point["scaling_efficiency_vs_base"], digits=3),
-                    _format_float(point["peak_cuda_max_allocated_mb"]),
+                    _format_float(point["peak_memory_mb"]),
                 ]
             )
             + " |"
