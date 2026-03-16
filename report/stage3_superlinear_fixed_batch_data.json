@@ -1,0 +1,68 @@
+{
+  "source_run_name": "stage3_fixed_seq1024_bs8_long",
+  "methodology": {
+    "type": "fixed_batch_stage3_scaling",
+    "host": "116.109.103.199",
+    "gpus": 16,
+    "model_size": "medium",
+    "seq_len": 1024,
+    "dtype": "bfloat16",
+    "zero_stage": 3,
+    "collective_impl": "torch",
+    "activation_checkpointing": true,
+    "fixed_batch_size_per_gpu": 8,
+    "steps": 8,
+    "baseline_gpu_count_for_linear_reference": 2
+  },
+  "points": [
+    {
+      "gpu_count": 2,
+      "batch_size_per_gpu": 8,
+      "global_tokens_per_step": 16384,
+      "total_tflops_per_s": 50.16016666666667,
+      "per_gpu_tflops_per_s": 25.080083333333334,
+      "perfect_linear_tflops_per_s": 50.16016666666667,
+      "superlinear_gain_vs_perfect_linear": 1.0,
+      "mean_comm_ms": 2642.8683333333333,
+      "mean_fb_ms": 2810.0933333333337
+    },
+    {
+      "gpu_count": 4,
+      "batch_size_per_gpu": 8,
+      "global_tokens_per_step": 32768,
+      "total_tflops_per_s": 108.46416666666666,
+      "per_gpu_tflops_per_s": 27.116041666666664,
+      "perfect_linear_tflops_per_s": 100.32033333333334,
+      "superlinear_gain_vs_perfect_linear": 1.0811782922039732,
+      "mean_comm_ms": 2470.445,
+      "mean_fb_ms": 2633.601666666667
+    },
+    {
+      "gpu_count": 8,
+      "batch_size_per_gpu": 8,
+      "global_tokens_per_step": 65536,
+      "total_tflops_per_s": 206.09550000000002,
+      "per_gpu_tflops_per_s": 25.761937500000002,
+      "perfect_linear_tflops_per_s": 200.64066666666668,
+      "superlinear_gain_vs_perfect_linear": 1.0271870773954102,
+      "mean_comm_ms": 2615.64,
+      "mean_fb_ms": 2785.81
+    },
+    {
+      "gpu_count": 16,
+      "batch_size_per_gpu": 8,
+      "global_tokens_per_step": 131072,
+      "total_tflops_per_s": 321.0468333333333,
+      "per_gpu_tflops_per_s": 20.065427083333333,
+      "perfect_linear_tflops_per_s": 401.28133333333335,
+      "superlinear_gain_vs_perfect_linear": 0.8000542429085495,
+      "mean_comm_ms": 3400.405,
+      "mean_fb_ms": 3582.9716666666664
+    }
+  ],
+  "notes": [
+    "This is the already-completed fixed-batch Stage 3 run that showed a real superlinear region at 4 and 8 GPUs.",
+    "The strongest superlinear point is 4 GPUs at 1.081x of perfect-linear relative to the 2-GPU baseline.",
+    "The superlinear region disappears by 16 GPUs as communication dominates."
+  ]
+}
