@@ -1,0 +1,29 @@
+{
+  "defaults": {
+    "name": "remote_16gpu_medium_stage3_scaling",
+    "results_dir": "experiments/results",
+    "model_size": "medium",
+    "steps": 10,
+    "seq_len": 256,
+    "grad_accum_steps": 1,
+    "collective_impl": "torch",
+    "data_mode": "synthetic",
+    "dtype": "bfloat16",
+    "metrics_warmup_steps": 2,
+    "tflops_mode": "profile",
+    "case_timeout_s": 5400.0,
+    "fit_mode": "oom_boundary",
+    "tuning_strategy": "predictive",
+    "memory_metric": "peak_cuda_max_allocated_mb",
+    "min_batch_size": 1,
+    "max_batch_size": 192,
+    "initial_batch_size": 0,
+    "batch_size_multiple": 1,
+    "growth_factor": 2.0,
+    "tuning_memory_warmup_steps": 2,
+    "extra_args": "--activation-checkpointing"
+  },
+  "matrix": {
+    "gpu_counts": [1, 2, 4, 8, 16]
+  }
+}
