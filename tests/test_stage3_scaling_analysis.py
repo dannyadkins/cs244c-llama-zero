@@ -69,6 +69,7 @@ def test_render_report_mentions_skipped_counts_and_reference() -> None:
             "speedup_vs_base": 1.0,
             "scaling_efficiency_vs_base": 1.0,
             "superlinear_gain_vs_perfect_linear": 1.0,
+            "peak_memory_mb": 23000.0,
             "peak_cuda_max_allocated_mb": 23000.0,
         },
         {
@@ -82,11 +83,12 @@ def test_render_report_mentions_skipped_counts_and_reference() -> None:
             "speedup_vs_base": 2.57,
             "scaling_efficiency_vs_base": 1.286,
             "superlinear_gain_vs_perfect_linear": 1.286,
+            "peak_memory_mb": 18000.0,
             "peak_cuda_max_allocated_mb": 18000.0,
         },
     ]
 
-    report = render_report(summary, points)
+    report = render_report(summary, points, baseline_gpu_count=2)
 
     assert "1" in report
     assert "ZeRO paper" in report
