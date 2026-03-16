@@ -62,12 +62,13 @@ class _Stage3ParamHandle:
     def world_size(self) -> int:
         return self.shard.world_size
 
-    def materialize(self) -> float:
+    def materialize(self, phase: str) -> float:
         if self.materialized:
             return 0.0
 
         t0 = time.perf_counter()
-        full_params = self.collectives.allgather(self.local_master_param_shard.to(dtype=self.param_dtype))
+        with self.collectives.label_scope(f"stage3.{phase}.allgather.{self.name}"):
+            full_params = self.collectives.allgather(self.local_master_param_shard.to(dtype=self.param_dtype))
         assign_flat_params(self.meta, full_params[: self.meta.total_numel])
         self.materialized = True
         return (time.perf_counter() - t0) * 1000.0
@@ -87,7 +88,8 @@ class _Stage3ParamHandle:
         flat_grads = _flatten_optional_grads(self.meta, param_grads)
 
         t0 = time.perf_counter()
-        reduced_shard = self.collectives.reduce_scatter(flat_grads)
+        with self.collectives.label_scope(f"stage3.backward.reduce_scatter.{self.name}"):
+            reduced_shard = self.collectives.reduce_scatter(flat_grads)
         comm_ms = (time.perf_counter() - t0) * 1000.0
 
         expected = self.shard.shard_numel
@@ -142,7 +144,7 @@ class _ShardedModuleFunction(torch.autograd.Function):
             ctx.autocast_dtype = torch.float32
 
         runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_forward")
-        forward_ms = runner.handle.materialize()
+        forward_ms = runner.handle.materialize("forward")
         runner.engine._record_forward_allgather_ms(
             forward_ms,
             num_bytes=runner.handle.meta.total_numel * torch.tensor([], dtype=runner.handle.param_dtype).element_size(),
@@ -176,7 +178,7 @@ class _ShardedModuleFunction(torch.autograd.Function):
                 torch.cuda.set_rng_state(ctx.cuda_rng_state, device=devices[0])
 
             runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_backward")
-            backward_allgather_ms = runner.handle.materialize()
+            backward_allgather_ms = runner.handle.materialize("backward")
             runner.engine._record_backward_allgather_ms(
                 backward_allgather_ms,
                 num_bytes=runner.handle.meta.total_numel * torch.tensor([], dtype=runner.handle.param_dtype).element_size(),
@@ -400,7 +402,7 @@ class ZeROStage3Optimizer:
         self._summon_depth += 1
         if self._summon_depth == 1:
             for handle in self._handle_order:
-                handle.materialize()
+                handle.materialize("summon")
         try:
             yield self.model
         finally:

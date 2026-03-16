@@ -115,7 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
 
-    parser.add_argument("--collective-impl", type=str, default="ring", choices=["ring", "torch"])
+    parser.add_argument("--collective-impl", type=str, default="torch", choices=["ring", "torch"])
     parser.add_argument("--data-mode", type=str, default="synthetic", choices=["synthetic", "fineweb"])
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
@@ -443,6 +443,7 @@ def _build_launch_env(
 ) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["ZERO_COLLECTIVE_CUDA_SYNC"] = "1"
     env.pop("ZERO_SIM_BW_GBPS", None)
     env.pop("ZERO_SIM_LATENCY_MS", None)
     env.pop("ZERO_SOCKET_SHAPER_BW_GBPS", None)

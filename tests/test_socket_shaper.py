@@ -187,6 +187,9 @@ def test_socket_shaper_builds_and_limits_local_tcp_throughput(tmp_path: Path) ->
     env["ZERO_SOCKET_SHAPER_BW_GBPS"] = "0.1"
     env["ZERO_SOCKET_SHAPER_LATENCY_MS"] = "0"
     env["ZERO_SOCKET_SHAPER_BURST_BYTES"] = "65536"
+    stats_dir = tmp_path / "stats"
+    stats_dir.mkdir()
+    env["ZERO_SOCKET_SHAPER_STATS_DIR"] = str(stats_dir)
     shaped = subprocess.run(
         [sys.executable, "-c", _transfer_script()],
         cwd=PROJECT_ROOT,
@@ -199,7 +202,14 @@ def test_socket_shaper_builds_and_limits_local_tcp_throughput(tmp_path: Path) ->
 
     assert shaped_metrics["seconds"] > unshaped_metrics["seconds"]
     assert shaped_metrics["mbps"] < unshaped_metrics["mbps"]
-    assert shaped_metrics["mbps"] < 200.0
+    # ZERO_SOCKET_SHAPER_BW_GBPS is specified in gigabits / second.
+    assert shaped_metrics["mbps"] < 140.0
+    stats_files = list(stats_dir.glob("socket_shaper_*.json"))
+    assert stats_files
+    stats = json.loads(stats_files[0].read_text())
+    assert stats["total_shaped_calls"] > 0
+    assert stats["total_shaped_bytes"] > 0
+    assert stats["total_bandwidth_sleep_s"] > 0.0
 
 
 def test_socket_shaper_shared_name_enforces_global_bucket_across_processes() -> None:

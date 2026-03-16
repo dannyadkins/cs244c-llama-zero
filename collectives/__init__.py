@@ -1,5 +1,5 @@
 from ._ring import ring_allgather, ring_allreduce, ring_reduce_scatter
-from .interface import CollectiveOps, LocalCollectives, SendRecvCollectives, TorchCollectives
+from .interface import CollectiveOps, LocalCollectives, SendRecvCollectives, TorchCollectives, TracingCollectives
 
 __all__ = [
     "ring_allreduce",
@@ -9,4 +9,5 @@ __all__ = [
     "LocalCollectives",
     "SendRecvCollectives",
     "TorchCollectives",
+    "TracingCollectives",
 ]

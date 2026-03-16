@@ -123,7 +123,8 @@ class ZeROStage2Optimizer:
 
         self._record_memory_event("measured_step_stage2_pre_reduce_scatter")
         t_comm0 = time.perf_counter()
-        reduced_shard = self.collectives.reduce_scatter(self.flat_grad_buffer)
+        with self.collectives.label_scope("stage2.backward.reduce_scatter.flat_grad_buffer"):
+            reduced_shard = self.collectives.reduce_scatter(self.flat_grad_buffer)
         rs_ms = (time.perf_counter() - t_comm0) * 1000.0
         self._backward_comm_ms += rs_ms
         self._backward_reduce_scatter_calls += 1
@@ -217,7 +218,8 @@ class ZeROStage2Optimizer:
         self._record_memory_event("measured_step_stage2_pre_allgather")
         t_comm1 = time.perf_counter()
         updated_local = self.local_master_param_shard.to(dtype=self.param_dtype)
-        full_updated = self.collectives.allgather(updated_local)
+        with self.collectives.label_scope("stage2.step.allgather.updated_param_shard"):
+            full_updated = self.collectives.allgather(updated_local)
         allgather_ms = (time.perf_counter() - t_comm1) * 1000.0
         self._post_step_allgather_ms += allgather_ms
         self._post_step_allgather_calls += 1

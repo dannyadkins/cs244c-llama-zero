@@ -12,7 +12,7 @@ from typing import Dict, Iterator, Tuple
 import torch
 import torch.distributed as dist
 
-from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
+from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives, TracingCollectives
 from model import (
     LlamaForCausalLM,
     build_config,
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weeks 2-3: ZeRO stages 0-3 training")
 
     parser.add_argument("--zero-stage", type=int, default=0, choices=[0, 1, 2, 3])
-    parser.add_argument("--collective-impl", type=str, default="ring", choices=["ring", "torch"])
+    parser.add_argument("--collective-impl", type=str, default="torch", choices=["ring", "torch"])
 
     parser.add_argument("--model-size", type=str, default="tiny", choices=["tiny", "small", "medium"])
     parser.add_argument("--seq-len", type=int, default=512)
@@ -106,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=str, default="")
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument("--profile-rank0-only", action="store_true")
+    parser.add_argument("--profile-collectives", action="store_true")
     parser.add_argument("--measure-memory-step", action="store_true")
     parser.add_argument("--memory-warmup-steps", type=int, default=0)
     parser.add_argument("--tflops-mode", type=str, default="estimate", choices=["estimate", "profile", "off"])
@@ -176,6 +177,28 @@ def pick_collectives(world_size: int, impl: str):
     if impl == "ring":
         return SendRecvCollectives()
     return TorchCollectives()
+
+
+def aggregate_collective_trace(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for record in records:
+        key = (str(record.get("op", "")), str(record.get("label", "")))
+        entry = by_key.get(key)
+        if entry is None:
+            entry = {
+                "op": key[0],
+                "label": key[1],
+                "calls": 0,
+                "elapsed_ms": 0.0,
+                "input_bytes": 0.0,
+                "output_bytes": 0.0,
+            }
+            by_key[key] = entry
+        entry["calls"] = int(entry["calls"]) + 1
+        entry["elapsed_ms"] = float(entry["elapsed_ms"]) + float(record.get("elapsed_ms", 0.0))
+        entry["input_bytes"] = float(entry["input_bytes"]) + float(record.get("input_bytes", 0.0))
+        entry["output_bytes"] = float(entry["output_bytes"]) + float(record.get("output_bytes", 0.0))
+    return sorted(by_key.values(), key=lambda item: (-float(item["elapsed_ms"]), str(item["label"]), str(item["op"])))
 
 
 def build_engine(args: argparse.Namespace, model: LlamaForCausalLM, collectives):
@@ -293,6 +316,8 @@ def train(args: argparse.Namespace) -> None:
     log_event(rank, "model parameter broadcast complete", force=verbose_enabled)
 
     collectives = pick_collectives(world_size=world_size, impl=args.collective_impl)
+    if args.profile_collectives:
+        collectives = TracingCollectives(collectives)
     engine = build_engine(args=args, model=model, collectives=collectives)
     log_event(rank, f"engine ready stage={args.zero_stage} impl={args.collective_impl}", force=verbose_enabled)
 
@@ -392,6 +417,8 @@ def train(args: argparse.Namespace) -> None:
         log_event(rank, f"starting step={step}/{args.max_steps}", force=verbose_enabled)
         sample_this_step = args.profile_memory_interval > 0 and (step == 1 or step == args.max_steps or step % args.profile_memory_interval == 0)
         is_measured_step = measured_step_index is not None and step == measured_step_index
+        if args.profile_collectives and hasattr(collectives, "consume_trace"):
+            collectives.consume_trace()
         iter_timer = timers.timer("iteration")
         iter_timer.start()
 
@@ -577,6 +604,12 @@ def train(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
+        step_collective_trace = []
+        step_collective_summary = []
+        if args.profile_collectives and hasattr(collectives, "consume_trace"):
+            step_collective_trace = collectives.consume_trace()
+            step_collective_summary = aggregate_collective_trace(step_collective_trace)
+
         if rank_profile_enabled:
             step_profiles.append(
                 {
@@ -617,6 +650,8 @@ def train(args: argparse.Namespace) -> None:
                     "communication_backward_allgather_bytes": float(
                         step_stats.get("communication_backward_allgather_bytes", 0.0)
                     ),
+                    "collective_trace": step_collective_trace,
+                    "collective_trace_summary": step_collective_summary,
                     "overlap_ratio": overlap_ratio,
                 }
             )
@@ -683,6 +718,12 @@ def train(args: argparse.Namespace) -> None:
                 "min": float(min(overlap_values)),
                 "max": float(max(overlap_values)),
             }
+        collective_trace_summary = None
+        if step_profiles and args.profile_collectives:
+            combined_trace = []
+            for step_profile in step_profiles:
+                combined_trace.extend(step_profile.get("collective_trace", []))
+            collective_trace_summary = aggregate_collective_trace(combined_trace)
         profile_payload = {
             "rank": rank,
             "world_size": world_size,
@@ -708,6 +749,7 @@ def train(args: argparse.Namespace) -> None:
                 "tflops_mode": args.tflops_mode,
             },
             "steps": step_profiles,
+            "collective_trace_summary": collective_trace_summary,
             "state_memory_breakdown_mb": state_memory_breakdown_mb,
             "overlap_summary": overlap_summary,
             "measured_step_memory": measured_step_memory,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import time
+from typing import Dict, Iterator, List
 
 import torch
 import torch.distributed as dist
@@ -43,6 +45,14 @@ class CollectiveOps:
 
     def allgather(self, local_shard: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    @contextmanager
+    def label_scope(self, label: str) -> Iterator[None]:
+        del label
+        yield
+
+    def consume_trace(self) -> List[Dict[str, object]]:
+        return []
 
 
 @dataclass
@@ -94,7 +104,11 @@ class TorchCollectives(CollectiveOps):
 
     @staticmethod
     def _maybe_synchronize(tensor: torch.Tensor) -> None:
-        if tensor.device.type == "cuda" and torch.cuda.is_available():
+        if (
+            tensor.device.type == "cuda"
+            and torch.cuda.is_available()
+            and os.environ.get("ZERO_COLLECTIVE_CUDA_SYNC", "0") == "1"
+        ):
             torch.cuda.synchronize(tensor.device)
 
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
@@ -227,6 +241,100 @@ class TorchCollectives(CollectiveOps):
 
         trimmed = [gathered[i][: sizes[i]] for i in range(world_size)]
         return torch.cat(trimmed, dim=0)
+
+
+@dataclass
+class TracingCollectives(CollectiveOps):
+    """Collective wrapper that records per-call timing and tensor sizes."""
+
+    inner: CollectiveOps
+
+    def __post_init__(self) -> None:
+        self._label_stack: List[str] = []
+        self._trace: List[Dict[str, object]] = []
+
+    @staticmethod
+    def _world_size() -> int:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_world_size())
+        return 1
+
+    @staticmethod
+    def _tensor_bytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def _current_label(self) -> str:
+        if not self._label_stack:
+            return ""
+        return "/".join(self._label_stack)
+
+    def _record(
+        self,
+        *,
+        op: str,
+        input_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+        elapsed_ms: float,
+    ) -> None:
+        self._trace.append(
+            {
+                "op": op,
+                "label": self._current_label(),
+                "input_bytes": self._tensor_bytes(input_tensor),
+                "output_bytes": self._tensor_bytes(output_tensor),
+                "elapsed_ms": float(elapsed_ms),
+                "world_size": self._world_size(),
+                "device": str(input_tensor.device),
+                "dtype": str(input_tensor.dtype).replace("torch.", ""),
+            }
+        )
+
+    @contextmanager
+    def label_scope(self, label: str) -> Iterator[None]:
+        self._label_stack.append(label)
+        try:
+            yield
+        finally:
+            self._label_stack.pop()
+
+    def consume_trace(self) -> List[Dict[str, object]]:
+        trace = list(self._trace)
+        self._trace.clear()
+        return trace
+
+    def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        t0 = time.perf_counter()
+        out = self.inner.allreduce(tensor, average=average)
+        self._record(op="allreduce", input_tensor=tensor, output_tensor=out, elapsed_ms=(time.perf_counter() - t0) * 1000.0)
+        return out
+
+    def allreduce_inplace(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        t0 = time.perf_counter()
+        out = self.inner.allreduce_inplace(tensor, average=average)
+        self._record(
+            op="allreduce_inplace",
+            input_tensor=tensor,
+            output_tensor=out,
+            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+        )
+        return out
+
+    def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
+        t0 = time.perf_counter()
+        out = self.inner.reduce_scatter(tensor)
+        self._record(
+            op="reduce_scatter",
+            input_tensor=tensor,
+            output_tensor=out,
+            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+        )
+        return out
+
+    def allgather(self, local_shard: torch.Tensor) -> torch.Tensor:
+        t0 = time.perf_counter()
+        out = self.inner.allgather(local_shard)
+        self._record(op="allgather", input_tensor=local_shard, output_tensor=out, elapsed_ms=(time.perf_counter() - t0) * 1000.0)
+        return out
 
 
 def _maybe_simulate_collective_delay(num_bytes: int, world_size: int) -> None:
