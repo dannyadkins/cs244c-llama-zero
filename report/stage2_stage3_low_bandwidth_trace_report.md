@@ -26,8 +26,8 @@ This rerun fixes all three:
   - stage 2: `96`
   - stage 3: `588`
 - Result artifacts:
-  - stage 2: `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage2_u_0p1_syncstats_torch`
-  - stage 3: `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage3_u_0p1_syncstats_torch`
+  - stage 2: `experiments/results/remote/<cluster-b>/manual_trace_stage2_u_0p1_syncstats_torch`
+  - stage 3: `experiments/results/remote/<cluster-b>/manual_trace_stage3_u_0p1_syncstats_torch`
 
 ## Top-line results
 
@@ -48,13 +48,13 @@ That ratio pattern is the core result. Stage 3 really does communicate more, but
 
 Latency/throughput figure:
 
-- `/Users/dannyadkins/cs244c-llama-zero/report/figures/stage2_stage3_step_latency.png`
+- `report/figures/stage2_stage3_step_latency.png`
 
 ## What the traces show
 
 ### Stage 2
 
-Profile: `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage2_u_0p1_syncstats_torch/profiles/s2_msmall_bw0.1gbps_np4_sl256_bs96_ga1_seed1337.json`
+Profile: `experiments/results/remote/<cluster-b>/manual_trace_stage2_u_0p1_syncstats_torch/profiles/s2_msmall_bw0.1gbps_np4_sl256_bs96_ga1_seed1337.json`
 
 Per measured step, stage 2 performs only two large collectives:
 
@@ -70,7 +70,7 @@ Aggregate trace over 2 traced steps:
 
 ### Stage 3
 
-Profile: `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage3_u_0p1_syncstats_torch/profiles/s3_msmall_bw0.1gbps_np4_sl256_bs588_ga1_seed1337.json`
+Profile: `experiments/results/remote/<cluster-b>/manual_trace_stage3_u_0p1_syncstats_torch/profiles/s3_msmall_bw0.1gbps_np4_sl256_bs588_ga1_seed1337.json`
 
 Stage 3 performs many more collectives at module granularity:
 
@@ -93,11 +93,11 @@ The shaper stats are the cleanest check that the trace is measuring real transpo
 
 Stage-2 shaper stats directory:
 
-- `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage2_u_0p1_syncstats_torch/shaper_stats`
+- `experiments/results/remote/<cluster-b>/manual_trace_stage2_u_0p1_syncstats_torch/shaper_stats`
 
 Stage-3 shaper stats directory:
 
-- `/Users/dannyadkins/cs244c-llama-zero/experiments/results/remote/184.144.212.225/manual_trace_stage3_u_0p1_syncstats_torch/shaper_stats`
+- `experiments/results/remote/<cluster-b>/manual_trace_stage3_u_0p1_syncstats_torch/shaper_stats`
 
 Summed over the 4 rank processes at `0.1 Gbps`:
 

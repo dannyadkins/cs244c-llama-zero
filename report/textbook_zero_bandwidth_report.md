@@ -11,7 +11,7 @@ It covers two questions:
 
 The fixed-workload section is complete below. The low-bandwidth fit-to-memory section is being filled from the current remote rerun:
 
-- `experiments/results/remote/184.144.213.79/remote_4gpu_small_fit_memory_socket_stage23_currentpaper_lowbw_oom1024`
+- `experiments/results/remote/<cluster-a>/remote_4gpu_small_fit_memory_socket_stage23_currentpaper_lowbw_oom1024`
 
 ## What Changed
 
@@ -34,7 +34,7 @@ The practical effect is:
 
 Run:
 
-- `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_currentpaper`
+- `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_currentpaper`
 
 Method:
 
@@ -92,7 +92,7 @@ Status:
 
 Run:
 
-- `experiments/results/remote/184.144.213.79/remote_4gpu_small_pairwise_crossover_socket_currentpaper_fixedbatches`
+- `experiments/results/remote/<cluster-a>/remote_4gpu_small_pairwise_crossover_socket_currentpaper_fixedbatches`
 
 Method:
 

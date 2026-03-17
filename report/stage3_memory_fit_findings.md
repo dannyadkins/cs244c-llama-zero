@@ -10,7 +10,7 @@
 
 Host:
 
-- `116.109.103.199`
+- `remote 16-GPU RTX 4090 host`
 - `16x RTX 4090`
 
 Workload:

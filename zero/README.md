@@ -1,34 +1,33 @@
-# ZeRO Optimizers (Weeks 2-3)
+# ZeRO Implementations
 
-Implemented stages:
+This directory contains the repository's ZeRO stage implementations and shared helpers.
 
-- `stage0_ddp.py`: full replication + gradient allreduce + local AdamW step
-- `stage1_optimizer.py`: optimizer-state sharding + gradient allreduce + parameter allgather
-- `stage2_optimizer.py`: optimizer-state sharding + bucketed gradient reduce-scatter + parameter allgather
-- `stage3_optimizer.py`: module-wise ZeRO-3 with sharded parameter residency, backward recomputation, per-module allgather/reduce-scatter, and sharded optimizer state
+## Stages
 
-Design goals:
+- `stage0_ddp.py`: fully replicated model with gradient all-reduce and local optimizer state
+- `stage1_optimizer.py`: optimizer-state sharding plus parameter all-gather
+- `stage2_optimizer.py`: optimizer-state sharding plus gradient reduce-scatter and parameter all-gather
+- `stage3_optimizer.py`: module-wise parameter sharding with lazy materialization, backward recomputation, and sharded optimizer state
 
-- Clear flat-parameter metadata in `common.py`
-- Explicit communication boundaries through `CollectiveOps`
-- Minimal hidden magic so stage transitions are easy to audit
-- Deterministic correctness checks against global-batch AdamW reference updates
-- Synchronized-gradient clipping semantics via `step(max_grad_norm=...)`
+## Design Principles
 
-Usage entrypoint:
+- explicit communication through the collectives interface
+- correctness-first implementations that are easy to audit
+- deterministic comparison against reference AdamW behavior
+- shared metadata utilities in `common.py` so stage transitions are easy to reason about
 
-- `train_zero.py` for multi-process stage 0/1/2/3 training
+## Entry Point
 
-Example:
+All stages are exercised through [`train_zero.py`](/home/thomason/github/cs244c-llama-zero/train_zero.py):
 
 ```bash
 python3 -m torch.distributed.run \
   --nproc_per_node=2 \
-  --master_addr=127.0.0.1 \
-  --master_port=29500 \
+  --master_addr=<master-addr> \
+  --master_port=<master-port> \
   train_zero.py \
   --zero-stage 3 \
-  --collective-impl ring \
+  --collective-impl torch \
   --data-mode synthetic \
   --model-size tiny \
   --seq-len 128 \
@@ -36,14 +35,10 @@ python3 -m torch.distributed.run \
   --max-steps 50
 ```
 
-Test coverage:
+## Testing
 
-- `zero/tests/test_zero_stages.py` validates stages 0/1/2/3 against reference optimizer
-- coverage includes `world_size` 2 and 3
-- includes a stage-2 and stage-3 gradient clipping parity check
+Core correctness coverage lives in [`zero/tests/test_zero_stages.py`](/home/thomason/github/cs244c-llama-zero/zero/tests/test_zero_stages.py). The tests compare stage behavior against a reference optimizer path and include gradient clipping parity checks.
 
-Note:
+## Current Scope
 
-- Stage 3 now shards parameters between module calls and rematerializes them lazily through the model forward path.
-- Stage 2 now buckets contiguous parameter ranges before `reduce_scatter`, so communication is no longer one collective per parameter tensor.
-- It is still correctness-first: no overlap/prefetch optimization yet, but parameter residency now matches the intended ZeRO-3 execution model much more closely.
+The implementations focus on correctness, measurement, and experimental clarity. They do not yet aim to reproduce every production optimization such as aggressive overlap, prefetch scheduling, or kernel fusion.

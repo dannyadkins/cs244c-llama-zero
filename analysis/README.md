@@ -1,59 +1,94 @@
 # Analysis
 
-Generate plots directly from `experiments/results/<run>/summary.json`.
+The analysis tools consume `experiments/results/<run-name>/summary.json` and turn completed sweeps into figures and markdown summaries.
 
-## Throughput vs Bandwidth
+## Main Entry Points
+
+- [`visualize.py`](/home/thomason/github/cs244c-llama-zero/analysis/visualize.py): plot throughput, communication, loss, and memory views
+- [`bandwidth_report.py`](/home/thomason/github/cs244c-llama-zero/analysis/bandwidth_report.py): generate a markdown report from one run directory
+
+## Common Plots
+
+Throughput vs bandwidth:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/<run-name> \
   --plot throughput \
-  --output analysis/figures/week3_throughput_vs_bandwidth.png
+  --output experiments/results/<run-name>/throughput.png
 ```
 
-## Communication vs Bandwidth
+Communication vs bandwidth:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/<run-name> \
   --plot comm \
-  --output analysis/figures/week3_comm_vs_bandwidth.png
+  --output experiments/results/<run-name>/comm.png
 ```
 
-## Loss Curves
+TFLOPs vs bandwidth:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
-  --plot loss \
-  --output analysis/figures/week3_loss_curves.png
+  --run-dir experiments/results/<run-name> \
+  --plot tflops \
+  --output experiments/results/<run-name>/tflops.png
 ```
 
-## Measured State Memory
-
-Use `--profile-memory-interval 1` (or higher) when collecting the run so the harness writes memory snapshots into each profile JSON. The training profile now also exports a measured ZeRO state-memory breakdown (`params`, `grads`, `optimizer`) from the engine internals, which is what `--plot memory` renders.
+Measured state memory:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/<run-name> \
   --plot memory \
   --bandwidth-gbps-filter 0 \
-  --output analysis/figures/week3_measured_state_memory.png
+  --output experiments/results/<run-name>/memory.png
 ```
 
-## Measured Peak Memory
-
-Use `--profile-memory-interval 1` (or higher) when collecting the run so the harness writes memory snapshots into each profile JSON.
+Peak memory:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/<run-name> \
   --plot peak-memory \
   --bandwidth-gbps-filter 0 \
-  --output analysis/figures/week3_peak_memory.png
+  --output experiments/results/<run-name>/peak_memory.png
 ```
 
-Optional filters:
+Loss curves:
 
-- `--model-size tiny|small|medium`
-- `--bandwidth-gbps-filter <value>`
+```bash
+python3 analysis/visualize.py \
+  --run-dir experiments/results/<run-name> \
+  --plot loss \
+  --output experiments/results/<run-name>/loss.png
+```
+
+## Plot Requirements
+
+Memory-oriented plots are most useful when the underlying run was collected with:
+
+```bash
+--profile-memory-interval 1
+```
+
+That enables step-level memory snapshots and measured ZeRO state-memory breakdowns in the profile JSON.
+
+## Markdown Summary
+
+Generate a report directly from the run directory:
+
+```bash
+python3 analysis/bandwidth_report.py \
+  --run-dir experiments/results/<run-name> \
+  --output experiments/results/<run-name>/bandwidth_report.md
+```
+
+The generated report summarizes:
+
+- methodology
+- per-stage workload
+- bandwidth-by-bandwidth ranking
+- throughput and communication tables
+- fit-to-memory tuning details when present

@@ -1,84 +1,85 @@
-# ZeRO From Scratch (Weeks 1-3)
+# LLaMA ZeRO Research Harness
 
-This repository now contains the Week 1 foundation, Week 2 ZeRO stages 0-2 integration, and Week 3 Stage 3 + experiment harness/analysis tooling.
+This repository is a from-scratch PyTorch implementation of LLaMA-style training plus a research harness for studying how ZeRO stages 0-3 trade memory savings against communication cost.
 
-For the current experiment status, runbook, and remaining execution plan, read `experiments/README.md`.
+The codebase is organized for reproducible systems experiments:
 
-## Implemented Scope
+- a baseline single-process trainer in [`train.py`](/home/thomason/github/cs244c-llama-zero/train.py)
+- distributed ZeRO training in [`train_zero.py`](/home/thomason/github/cs244c-llama-zero/train_zero.py)
+- config-driven experiment orchestration in [`experiments/harness.py`](/home/thomason/github/cs244c-llama-zero/experiments/harness.py)
+- plotting and markdown report generation in [`analysis/`](/home/thomason/github/cs244c-llama-zero/analysis)
 
-### Week 1 Person A
+## Research Focus
 
-- LLaMA-style architecture in pure PyTorch (`RMSNorm`, `RoPE`, `GQA`, `SwiGLU`)
-- `tiny`, `small`, `medium` model configs
-- Single-device training script: `train.py`
-- FineWeb-Edu streaming pipeline + synthetic fallback
-- Baseline correctness tests for model/data/training
+The project is built to answer three questions:
 
-### Week 1 Person B
+1. How much model-state memory does each ZeRO stage save in practice?
+2. How much communication overhead does each stage introduce as bandwidth drops?
+3. When stages are allowed to use their memory savings for larger microbatches, how does the throughput ranking change?
 
-- Ring collectives from point-to-point `send/recv`
-- Distributed correctness tests vs torch collective behavior
-- Profiling utilities: timers, memory snapshots, overlap metrics
-- Infra scripts for setup, launch, and `tc` throttling
+## What Is Implemented
 
-### Week 2 (ZeRO 0-2)
+- LLaMA-style language model components in pure PyTorch: RMSNorm, RoPE, grouped-query attention, and SwiGLU
+- ZeRO stages 0, 1, 2, and 3 with explicit communication boundaries
+- synthetic and FineWeb-based training data paths
+- a bandwidth-sensitive experiment harness with local, single-node, and remote workflows
+- measurement plumbing for throughput, TFLOPs, communication time, and memory
+- plotting and markdown reporting utilities for completed runs
 
-- `zero/stage0_ddp.py`: replicated model + gradient allreduce + local AdamW
-- `zero/stage1_optimizer.py`: sharded optimizer state + gradient allreduce + param allgather
-- `zero/stage2_optimizer.py`: sharded optimizer state + gradient reduce-scatter + param allgather
-- `train_zero.py`: distributed training entrypoint with profiling output
+## Repository Map
 
-### Week 3 (ZeRO 3 + Harness)
+- [`model/`](/home/thomason/github/cs244c-llama-zero/model): model configs and LLaMA-style modules
+- [`data/`](/home/thomason/github/cs244c-llama-zero/data): tokenization and dataset utilities
+- [`collectives/`](/home/thomason/github/cs244c-llama-zero/collectives): communication interfaces and ring collectives
+- [`zero/`](/home/thomason/github/cs244c-llama-zero/zero): ZeRO stage implementations
+- [`profiler/`](/home/thomason/github/cs244c-llama-zero/profiler): step timing, FLOP estimation, and memory tracking
+- [`experiments/`](/home/thomason/github/cs244c-llama-zero/experiments): experiment harness, configs, and remote runners
+- [`analysis/`](/home/thomason/github/cs244c-llama-zero/analysis): plots and report generation
+- [`report/`](/home/thomason/github/cs244c-llama-zero/report): research notes and synthesized findings
+- [`tests/`](/home/thomason/github/cs244c-llama-zero/tests): unit and integration coverage
 
-- `zero/stage3_optimizer.py`: module-wise Stage 3 parameter sharding/materialization with backward recomputation
-- `train_zero.py --zero-stage 3` integration
-- `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
-- `experiments/run_remote_bandwidth_sweep.py`: ship the current repo to an isolated remote workspace, run a sweep, sync results back, and generate plots + a markdown report
-- `experiments/run_fit_memory_bandwidth.py`: tune the largest per-stage microbatch under one GPU-memory budget, then sweep bandwidth with those tuned workloads
-- `experiments/run_remote_fit_memory_bandwidth.py`: remote wrapper for the fit-to-memory workflow
-- Linux socket-transport bandwidth shaping via `LD_PRELOAD` + forced NCCL `NET/Socket` on loopback, using a shared token bucket across all ranks in a case
-- Legacy collective-delay simulation mode for quick debugging (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
-- Optional `tc` throttling mode integration in harness
-- Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
-- `analysis/visualize.py`: plots for throughput/communication vs bandwidth, loss curves, and measured/theoretical memory
-- `analysis/bandwidth_report.py`: markdown summary of best stage by bandwidth plus throughput/communication tables
-- `scripts/benchmark_allreduce.py`: raw allreduce throughput benchmark for validating shaped transports
+## Code Logic
 
-## Repository Layout
+The core control flow is straightforward:
 
-- `model/`: architecture + configs
-- `data/`: streaming/tokenization/dataset utilities
-- `collectives/`: ring collectives + communication interface + distributed tests
-- `zero/`: ZeRO stage implementations and shared utilities
-- `profiler/`: timing/memory/overlap instrumentation
-- `infra/`: setup/launch/throttle scripts
-- `scripts/`: distributed sanity + collective benchmarking
-- `experiments/`: harness + configs + result artifacts
-- `analysis/`: figure generation tools
-- `report/`: writeup scaffold
-- `tests/`: unit/integration tests
+1. [`train.py`](/home/thomason/github/cs244c-llama-zero/train.py) builds a model, loads synthetic or streamed text data, and runs a standard single-process training loop.
+2. [`train_zero.py`](/home/thomason/github/cs244c-llama-zero/train_zero.py) initializes distributed state, selects a ZeRO engine, and records step-level metrics such as `tokens/s`, `comm_ms`, and optional memory traces.
+3. [`experiments/harness.py`](/home/thomason/github/cs244c-llama-zero/experiments/harness.py) enumerates a matrix over stages, model sizes, and bandwidth settings, launches `torch.distributed.run`, and writes one result record per case plus a run-level `summary.json`.
+4. [`analysis/visualize.py`](/home/thomason/github/cs244c-llama-zero/analysis/visualize.py) reads `summary.json` and produces throughput, communication, loss, and memory figures.
+5. [`analysis/bandwidth_report.py`](/home/thomason/github/cs244c-llama-zero/analysis/bandwidth_report.py) turns a completed run directory into a markdown summary suitable for a report appendix or experiment log.
 
 ## Setup
 
+Install Python dependencies from the repository root:
+
 ```bash
-cd /Users/danieladkins/cs244c-llama-zero
 ./infra/setup.sh
 ```
 
-## Test Everything
+Or install them directly:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+## Tests
+
+Run the full suite:
 
 ```bash
 pytest -q
 ```
 
-Distributed-focused tests:
+Focused distributed coverage:
 
 ```bash
-pytest -q collectives/tests/test_collectives_distributed.py
 pytest -q zero/tests/test_zero_stages.py
+pytest -q collectives/tests/test_collectives_distributed.py
 ```
 
-## Baseline Training (Single GPU / CPU)
+## Quick Start
+
+Single-process baseline:
 
 ```bash
 python3 train.py \
@@ -90,178 +91,137 @@ python3 train.py \
   --max-steps 100
 ```
 
-## ZeRO Training (Stages 0-3)
+Two-process ZeRO smoke test:
 
 ```bash
 python3 -m torch.distributed.run \
   --nproc_per_node=2 \
-  --master_addr=127.0.0.1 \
-  --master_port=29500 \
+  --master_addr=<master-addr> \
+  --master_port=<master-port> \
   train_zero.py \
   --zero-stage 3 \
-  --collective-impl ring \
+  --collective-impl torch \
   --data-mode synthetic \
   --model-size tiny \
   --seq-len 128 \
   --batch-size 4 \
-  --max-steps 50 \
-  --profile-json experiments/results/stage3_profile.json \
+  --max-steps 20 \
+  --profile-json experiments/results/stage3_smoke/profile.json \
   --profile-rank0-only
 ```
 
-## Week 3 Harness
+For single-node runs, `<master-addr>` is typically loopback on the launch host and `<master-port>` should be any free rendezvous port on that machine.
 
-Run a config-driven matrix:
+## Running Experiments
 
-```bash
-python3 experiments/harness.py --config experiments/configs/remote_4gpu_bandwidth_smoke.json
-```
-
-Run a custom sweep directly from CLI:
+Config-driven bandwidth sweep:
 
 ```bash
 python3 experiments/harness.py \
-  --name week3_medium_bandwidth \
+  --config experiments/configs/remote_4gpu_small_bandwidth_socket.json
+```
+
+Equivalent CLI-driven sweep:
+
+```bash
+python3 experiments/harness.py \
+  --name small_gpu_bw_sweep \
+  --results-dir experiments/results \
   --stages 0 1 2 3 \
-  --model-sizes medium \
-  --bandwidth-gbps 0 1 2.5 5 10 25 50 \
-  --bandwidth-mode socket \
-  --socket-interface lo \
+  --model-sizes small \
+  --bandwidth-gbps 0 1 2 5 10 \
   --nproc-per-node 2 \
-  --steps 100
+  --steps 30 \
+  --seq-len 128 \
+  --batch-size 4 \
+  --grad-accum-steps 1 \
+  --collective-impl torch \
+  --data-mode synthetic \
+  --dtype bfloat16 \
+  --profile-memory-interval 1 \
+  --bandwidth-mode socket \
+  --socket-interface lo
 ```
 
-Optional real throttling mode (Linux root/sudo required):
+Fit-to-memory workflow:
 
 ```bash
-python3 experiments/harness.py \
-  --name week3_tc_trial \
-  --stages 2 3 \
-  --model-sizes tiny \
-  --bandwidth-gbps 5 10 \
-  --bandwidth-mode tc \
-  --tc-interface eth0
+python3 experiments/run_fit_memory_bandwidth.py \
+  --config experiments/configs/remote_4gpu_small_fit_memory_socket.json
 ```
 
-Run the current branch on a remote GPU machine in an isolated workspace and pull the finished run back locally:
+Remote execution and result collection:
 
 ```bash
 python3 experiments/run_remote_bandwidth_sweep.py \
-  --host 184.144.213.79 \
-  --port 40787 \
+  --host <remote-host> \
+  --port <ssh-port> \
   --config experiments/configs/remote_4gpu_small_bandwidth_socket.json \
   --overwrite-local
 ```
 
-Run the fit-to-memory experiment, which first tunes the largest per-stage microbatch under a fixed GPU-memory budget and then reruns the bandwidth sweep with those tuned microbatches:
+The remote runners archive the current repository state, execute in a clean remote workspace, pull the finished run directory back into `experiments/results/remote/`, and optionally generate plots and a markdown report.
 
-```bash
-python3 experiments/run_remote_fit_memory_bandwidth.py \
-  --host 184.144.213.79 \
-  --port 40787 \
-  --config experiments/configs/remote_4gpu_small_fit_memory_socket.json \
-  --overwrite-local
-```
+More operational detail lives in [`experiments/README.md`](/home/thomason/github/cs244c-llama-zero/experiments/README.md).
 
-Use the simulated fast config only for coarse debugging when socket shaping is unavailable:
+## Result Artifacts
 
-```bash
-python3 experiments/run_remote_bandwidth_sweep.py \
-  --host 184.144.213.79 \
-  --port 40787 \
-  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
-  --overwrite-local
-```
+Each harness run writes a self-contained directory under `experiments/results/<run-name>/`:
 
-## Visualization
+- `summary.json`: aggregate metadata plus the result record for every case
+- `cases/*.json`: one machine-readable result per launched case
+- `logs/*.log`: captured stdout and stderr from the training job
+- `profiles/*.json`: rank-0 profile data and memory snapshots when enabled
 
-Throughput vs bandwidth:
+Key metrics include:
+
+- `mean_tokens_per_s`: end-to-end training throughput
+- `mean_tflops_per_s`: training throughput derived from profiler or estimator output
+- `mean_comm_ms`: mean communication time attributed per step
+- `measured_state_memory_mb`: measured parameter, gradient, and optimizer memory when available
+- peak host or CUDA memory fields: observed allocation behavior during the run
+
+## Analysis And Reporting
+
+Generate a throughput plot:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/small_gpu_bw_sweep \
   --plot throughput \
-  --output analysis/figures/week3_throughput_vs_bandwidth.png
+  --output experiments/results/small_gpu_bw_sweep/throughput.png
 ```
 
-Communication vs bandwidth:
+Generate a communication plot:
 
 ```bash
 python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
+  --run-dir experiments/results/small_gpu_bw_sweep \
   --plot comm \
-  --output analysis/figures/week3_comm_vs_bandwidth.png
+  --output experiments/results/small_gpu_bw_sweep/comm.png
 ```
 
-Loss curves:
+Generate a markdown summary:
 
 ```bash
-python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
-  --plot loss \
-  --output analysis/figures/week3_loss_curves.png
+python3 analysis/bandwidth_report.py \
+  --run-dir experiments/results/small_gpu_bw_sweep \
+  --output experiments/results/small_gpu_bw_sweep/bandwidth_report.md
 ```
 
-Measured peak memory by stage:
+Additional plotting notes are in [`analysis/README.md`](/home/thomason/github/cs244c-llama-zero/analysis/README.md).
 
-```bash
-python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
-  --plot memory \
-  --bandwidth-gbps-filter 0 \
-  --output analysis/figures/week3_peak_memory.png
-```
+## Notes On Bandwidth Control
 
-Theoretical state memory by stage:
+The repository supports multiple bandwidth modes:
 
-```bash
-python3 analysis/visualize.py \
-  --run-dir experiments/results/week3_medium_bandwidth \
-  --plot theory-memory \
-  --bandwidth-gbps-filter 0 \
-  --output analysis/figures/week3_theory_memory.png
-```
+- `none`: no throttling
+- `simulated`: artificial delay inside the collective layer
+- `socket`: socket-level shaping via `LD_PRELOAD` for NCCL `NET/Socket`
+- `tc`: Linux traffic-control shaping on a chosen interface
 
-## Bandwidth Control (`tc`)
+For interface-level validation, use [`scripts/validate_bandwidth.py`](/home/thomason/github/cs244c-llama-zero/scripts/validate_bandwidth.py) with a user-selected bind address and service port appropriate for your test environment.
 
-```bash
-./infra/throttle.sh apply eth0 10gbit 1mb 10ms
-./infra/throttle.sh status eth0
-./infra/throttle.sh delete eth0
-```
+## Reproducibility
 
-Validate applied throttling with `iperf3` before collecting data.
-
-For a reproducible `tc` + `iperf3` check, run an iperf server on the peer host:
-
-```bash
-python3 scripts/validate_bandwidth.py server --bind 0.0.0.0 --port 5201
-```
-
-Then run the validation from the client host:
-
-```bash
-python3 scripts/validate_bandwidth.py validate \
-  --target-host <peer-ip> \
-  --port 5201 \
-  --device eth0 \
-  --rate 10gbit \
-  --duration-s 5 \
-  --json-output /tmp/tc_validation.json
-```
-
-This script records baseline throughput, applies `tc`, measures shaped throughput, clears `tc`, and fails if the shaped bandwidth does not drop enough. Use two hosts or two VMs connected through the interface you plan to shape; traffic to the local machine's own IP will typically route through `lo` and is not a meaningful `eth0` validation. In containers, root may still be insufficient if the runtime does not grant `CAP_NET_ADMIN`.
-
-## Communication Interface Contract
-
-ZeRO wrappers treat communication as a black box:
-
-- `allreduce(tensor, average=True)`
-- `reduce_scatter(tensor)`
-- `allgather(local_shard)`
-
-Implementations:
-
-- `SendRecvCollectives`: custom ring transport
-- `TorchCollectives`: torch distributed baseline
-- `LocalCollectives`: single-process fallback
+This repository is intended to be reusable across clusters and personal workstations. Documentation examples therefore use placeholders for network addresses, rendezvous ports, remote hosts, and filesystem roots rather than lab-specific infrastructure details.

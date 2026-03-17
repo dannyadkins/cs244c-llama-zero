@@ -7,9 +7,9 @@ Why did ZeRO Stage 3 outperform ZeRO Stage 2 in the low-bandwidth sweep even tho
 ## Runs Used
 
 - Main communication-shape sweep:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_steps6`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_steps6`
 - One-case retry for the missing `stage2 @ 0.5 Gbps` point:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_s2_bw0p5_retry`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_s2_bw0p5_retry`
 
 The main run used:
 
@@ -180,7 +180,7 @@ This keeps the same math and sharded optimizer update, but removes the `3.84x` p
 
 We then reran a single remote GPU validation case on the same host:
 
-- run: `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage2_fixcheck_bw0p5`
+- run: `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage2_fixcheck_bw0p5`
 - model: `small`
 - GPUs: `4`
 - bandwidth: `0.5 Gbps`
@@ -211,7 +211,7 @@ That was not a clean current-code comparison, because:
 
 To test the `1 Gbps` point directly, we ran a fresh remote head-to-head with the current code for both stages:
 
-- run: `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_bw1_postfix`
+- run: `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage2_stage3_commshape_bw1_postfix`
 - model: `small`
 - GPUs: `4`
 - bandwidth: `1 Gbps`

@@ -2,7 +2,7 @@
   "source_run_name": "stage3_fixed_seq1024_bs8_long",
   "methodology": {
     "type": "fixed_batch_stage3_scaling",
-    "host": "116.109.103.199",
+    "host": "remote 16-GPU RTX 4090 host",
     "gpus": 16,
     "model_size": "medium",
     "seq_len": 1024,

@@ -14,24 +14,24 @@ The goal is to separate two different questions:
 ### Fixed-workload bandwidth sweeps
 
 - Main 4-stage socket sweep:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket`
 - Corrected stage-2/stage-3 rerun after stage-2 bucketing and shared-link shaping fixes:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage23_bucketed_shared`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage23_bucketed_shared`
 - Stage-1 tail rerun:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_bandwidth_socket_stage1_tail_shared`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_bandwidth_socket_stage1_tail_shared`
 - Stage-2 vs stage-3 low-bandwidth diagnosis and targeted fix validation:
   - `report/stage2_stage3_low_bandwidth_findings.md`
 
 ### Fit-to-memory data
 
 - Completed stage-0 vs stage-3 fit-to-memory probe:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_fit_memory_socket_probe_sl256`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_fit_memory_socket_probe_sl256`
 - Completed fixed current-code stage-1 fit-to-memory rerun:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_fit_memory_socket_stage1_fixed`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_fit_memory_socket_stage1_fixed`
 - Completed fixed current-code stage-2 fit-to-memory rerun:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_fit_memory_socket_stage2_fixed`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_fit_memory_socket_stage2_fixed`
 - Earlier current-code stage-2 vs stage-3 fit-to-memory bandwidth sweep:
-  - `experiments/results/remote/184.144.213.79/remote_4gpu_small_fit_memory_socket_stage23_current`
+  - `experiments/results/remote/<cluster-a>/remote_4gpu_small_fit_memory_socket_stage23_current`
 
 ## Method
 
